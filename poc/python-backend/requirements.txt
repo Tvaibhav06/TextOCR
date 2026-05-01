@@ -1,0 +1,9 @@
+# Python backend dependencies — POC
+# Install:  pip install -r python-backend/requirements.txt
+
+opencv-python>=4.9
+numpy>=1.26
+
+# Testing
+pytest>=8.0
+pytest-benchmark>=4.0   # optional: for benchmarking pipeline stages
