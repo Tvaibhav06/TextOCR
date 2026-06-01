@@ -14,7 +14,7 @@
 import { textDetector, type DetectionResult } from './TextDetector';
 import { maskGenerator,  type MaskResult }     from './MaskGenerator';
 import { inpainter }                            from './Inpainter';
-import { poissonBlender, qualityAssessor }      from './PostProcessor';
+import { nativeImageProcessor, qualityAssessor } from './PostProcessor';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -139,7 +139,7 @@ export class TextRemovalPipeline {
         detections,
         input.imageWidth,
         input.imageHeight,
-        { dilationPx: input.dilationPx ?? 3 },
+        { dilationPx: input.dilationPx ?? 7 },
       );
       report('masking', performance.now() - ts, true,
         `${(mask.coverage * 100).toFixed(1)}% coverage`);
@@ -175,24 +175,27 @@ export class TextRemovalPipeline {
     // ── Stage 4: Post-processing ──────────────────────────────────────────────
     progress('postprocessing', 80, 'Blending edges…');
     ts = performance.now();
+
+    // Native edge-blend: OpenCV seamlessClone over mask boundary.
+    // Track 2 stub: native module returns inpaintedUri unchanged.
+    // Track 3 wiring: real cv::seamlessClone path activated.
     let finalUri = inpaintedUri;
+    if (input.enablePoisson !== false && nativeImageProcessor.isAvailable()) {
+      try {
+        const maskB64 = nativeImageProcessor.maskToBase64(mask);
+        finalUri = await nativeImageProcessor.blend(input.imageUri, inpaintedUri, maskB64);
+      } catch (blendErr) {
+        console.warn('[Pipeline] Native blend failed, using raw inpainted:', blendErr);
+        finalUri = inpaintedUri;
+      }
+    }
 
     // ⚠️ POC LIMITATION — Quality assessment uses stub pixel arrays.
-    //
-    // Reading actual pixels from a URI requires expo-file-system + Skia
-    // readPixels integration that is not yet implemented in this POC.
-    //
-    // What the SSIM/PSNR values mean here:
-    //   - stubOrig  = all zeros (black image)
-    //   - stubResult = all zeros except byte[0] = 128
-    //   → SSIM will be < 1, MSE > 0: the QA math paths ARE exercised.
-    //   → Absolute values are meaningless — do not use to gate quality decisions.
-    //
-    // Production fix: read originalPixels via Skia.Surface.makeImageSnapshot()
-    //   and resultPixels similarly, then pass both to qualityAssessor.assess().
+    // Reading actual pixels requires Skia.Surface.makeImageSnapshot() integration
+    // not yet implemented in this POC. QA math is exercised but values are not
+    // meaningful — do not use to gate quality decisions.
     const stubOrig   = new Uint8Array(input.imageWidth * input.imageHeight * 4);
     const stubResult = new Uint8Array(input.imageWidth * input.imageHeight * 4);
-    // Introduce a single-byte difference so QA math is non-degenerate
     if (stubResult.length > 4) { stubResult[0] = 128; stubResult[1] = 128; stubResult[2] = 128; }
 
     const quality = qualityAssessor.assess(stubOrig, stubResult, mask, 0.82);
@@ -200,6 +203,7 @@ export class TextRemovalPipeline {
     report('postprocessing', performance.now() - ts, true,
       `SSIM=${quality.ssim.toFixed(3)} PSNR=${quality.psnr}dB`);
     console.log(`[Pipeline] Stage 4 ✓ — SSIM=${quality.ssim.toFixed(3)} in ${Math.round(performance.now()-ts)}ms`);
+
 
     progress('done', 100, 'Done!');
 

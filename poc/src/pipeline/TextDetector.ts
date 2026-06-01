@@ -9,9 +9,10 @@
  * Returns an array of DetectionResult with bounding polygon + confidence.
  */
 
-import { NativeModules, Platform } from 'react-native';
+import { Platform } from 'react-native';
 import type { TensorflowModel } from 'react-native-fast-tflite';
 import { loadTensorflowModel } from 'react-native-fast-tflite';
+import TextRecognition from '@react-native-ml-kit/text-recognition';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,14 +53,8 @@ const DEFAULT_CONFIG: DetectorConfig = {
  * pixel coords; we convert to normalised polygon format here.
  */
 class MLKitTextDetector {
-  private module = NativeModules.MLKitTextDetection;
-
   async isAvailable(): Promise<boolean> {
-    try {
-      return await this.module.isModelAvailable();
-    } catch {
-      return false;
-    }
+    return true; // The library is always available natively
   }
 
   async detect(
@@ -68,37 +63,32 @@ class MLKitTextDetector {
     imageHeight: number,
     threshold: number,
   ): Promise<DetectionResult[]> {
-    // Native call — returns raw JSON array from ML Kit TextRecognition API
-    const raw: Array<{
-      boundingBox: { left: number; top: number; right: number; bottom: number };
-      confidence: number;
-      cornerPoints?: Array<{ x: number; y: number }>;
-    }> = await this.module.detectText(imageUri, threshold);
-
-    return raw.map((r, idx) => {
-      // Prefer cornerPoints (polygon) if present; fall back to bbox rect
-      const pts = r.cornerPoints && r.cornerPoints.length === 4
-        ? r.cornerPoints.map(p => ({
+    const result = await TextRecognition.recognize(imageUri);
+    
+    return result.blocks.map((b: any, idx: number) => {
+      // Use cornerPoints if available, else derive from frame
+      const pts = b.cornerPoints && b.cornerPoints.length === 4
+        ? b.cornerPoints.map((p: any) => ({
             x: p.x / imageWidth,
             y: p.y / imageHeight,
           }))
         : [
-            { x: r.boundingBox.left  / imageWidth, y: r.boundingBox.top    / imageHeight },
-            { x: r.boundingBox.right / imageWidth, y: r.boundingBox.top    / imageHeight },
-            { x: r.boundingBox.right / imageWidth, y: r.boundingBox.bottom / imageHeight },
-            { x: r.boundingBox.left  / imageWidth, y: r.boundingBox.bottom / imageHeight },
+            { x: b.frame.left / imageWidth, y: b.frame.top / imageHeight },
+            { x: (b.frame.left + b.frame.width) / imageWidth, y: b.frame.top / imageHeight },
+            { x: (b.frame.left + b.frame.width) / imageWidth, y: (b.frame.top + b.frame.height) / imageHeight },
+            { x: b.frame.left / imageWidth, y: (b.frame.top + b.frame.height) / imageHeight },
           ];
 
       return {
         id: idx,
         polygon: { points: pts },
         bbox: {
-          x: r.boundingBox.left / imageWidth,
-          y: r.boundingBox.top  / imageHeight,
-          width:  (r.boundingBox.right  - r.boundingBox.left) / imageWidth,
-          height: (r.boundingBox.bottom - r.boundingBox.top)  / imageHeight,
+          x: b.frame.left / imageWidth,
+          y: b.frame.top / imageHeight,
+          width: b.frame.width / imageWidth,
+          height: b.frame.height / imageHeight,
         },
-        confidence: r.confidence ?? 0.9,  // ML Kit doesn't always return confidence
+        confidence: 0.9, // TextRecognition doesn't always expose confidence per block
         source: 'mlkit' as const,
       };
     });

@@ -23,6 +23,27 @@ import { NativeModules } from 'react-native';
 import { loadTensorflowModel } from 'react-native-fast-tflite';
 import type { MaskResult } from './MaskGenerator';
 
+// ─── Hermes-safe base64 encoder ───────────────────────────────────────────────
+// btoa() is a browser Web API — it does NOT exist in Hermes on React Native
+// 0.73.x. This pure-JS implementation works on any JS engine.
+const BASE64_CHARS =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function toBase64(bytes: Uint8Array): string {
+  let result = '';
+  const len = bytes.length;
+  for (let i = 0; i < len; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < len ? bytes[i + 1] : 0;
+    const b2 = i + 2 < len ? bytes[i + 2] : 0;
+    result += BASE64_CHARS[b0 >> 2];
+    result += BASE64_CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+    result += i + 1 < len ? BASE64_CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] : '=';
+    result += i + 2 < len ? BASE64_CHARS[b2 & 0x3f] : '=';
+  }
+  return result;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type InpaintMethod = 'telea' | 'ns' | 'pconv';
@@ -43,32 +64,31 @@ export interface InpaintResult {
 
 const DEFAULT_INPAINT_CONFIG: InpaintConfig = {
   method: 'telea',
-  inpaintRadius: 5,
+  inpaintRadius: 10,
   pconvCoverageThreshold: 0.15,
 };
 
 // ─── OpenCV Native Bridge ─────────────────────────────────────────────────────
 
 /**
- * OpenCVInpainter bridges to the native OpenCV module.
+ * OpenCVInpainter bridges to the native OpenCVProcessor TurboModule.
  *
- * Native side (Android: JNI via CMake / iOS: Objective-C++ wrapper):
- *   Mat img   = imread(imagePath);
- *   Mat mask  = Scalar(0) then fill from maskData (Uint8Array over bridge)
- *   inpaint(img, mask, dst, radius, INPAINT_TELEA | INPAINT_NS)
- *   imwrite(outputPath, dst)
+ * Track 3: Uses NativeModules.OpenCVProcessor.processImage() with
+ * method: 'inpaint_telea' or 'inpaint_ns'.
+ * This consolidates all OpenCV operations into a single native module.
  *
- * Bridge passes:
- *   - imageUri: local file path
- *   - maskBase64: base64-encoded single-channel PNG of the mask
- *   - radius: inpaint neighbourhood radius
- *   - method: 'telea' | 'ns'
+ * C++ side (OpenCVProcessor.cpp):
+ *   cv::Mat img  = cv::imread(imagePath)
+ *   cv::Mat mask = decodeMask(maskBase64, img.cols, img.rows)
+ *   cv::inpaint(img, mask, dst, radius, INPAINT_TELEA | INPAINT_NS)
+ *   cv::imwrite(tempPath, dst)
+ *   resolves Promise with "file://" + tempPath
  */
 class OpenCVInpainter {
-  private module = NativeModules.OpenCVInpaint;
+  private module = NativeModules.OpenCVProcessor;
 
-  async isAvailable(): Promise<boolean> {
-    return typeof this.module?.inpaint === 'function';
+  isAvailable(): boolean {
+    return typeof this.module?.processImage === 'function';
   }
 
   async inpaint(
@@ -76,29 +96,34 @@ class OpenCVInpainter {
     mask: MaskResult,
     config: InpaintConfig,
   ): Promise<string> {
-    const maskBase64 = this.maskToBase64PNG(mask);
+    if (!this.isAvailable()) {
+      throw new Error('[OpenCVInpainter] NativeModules.OpenCVProcessor not available');
+    }
 
-    const outputUri: string = await this.module.inpaint({
+    const maskBase64 = this.maskToBase64(mask);
+    const method     = config.method === 'ns' ? 'inpaint_ns' : 'inpaint_telea';
+
+    const outputUri: string = await this.module.processImage(
       imageUri,
       maskBase64,
-      radius: config.inpaintRadius,
-      method: config.method === 'ns' ? 'ns' : 'telea',
-    });
+      {
+        method,
+        radius: config.inpaintRadius,
+      },
+    );
 
     return outputUri;
   }
 
   /**
-   * Encode single-channel Uint8Array mask as a base64 string.
+   * Encode single-channel Uint8Array mask as base64.
+   * Expands 1-channel mask to RGBA so decodeMask() on the C++ side
+   * can extract the R channel uniformly (same encoding as PostProcessor).
    *
-   * ⚠️ POC NOTE: Uses btoa() which is available in React Native's Hermes runtime.
-   * `Buffer` is a Node.js global — it does NOT exist in Hermes and will crash
-   * at runtime. btoa() on a binary string is the Hermes-safe equivalent.
-   *
-   * Production upgrade path: write mask to a temp file via expo-file-system and
-   * read it back as base64 — avoids the full RGBA buffer allocation over the bridge.
+   * Uses the module-level toBase64() helper instead of btoa() because
+   * btoa is NOT available in Hermes on React Native 0.73.x.
    */
-  private maskToBase64PNG(mask: MaskResult): string {
+  private maskToBase64(mask: MaskResult): string {
     const rgba = new Uint8Array(mask.width * mask.height * 4);
     for (let i = 0; i < mask.width * mask.height; i++) {
       const v = mask.data[i];
@@ -107,10 +132,7 @@ class OpenCVInpainter {
       rgba[i * 4 + 2] = v;
       rgba[i * 4 + 3] = 255;
     }
-    // Hermes-safe base64 encoding — no Buffer, no external lib
-    let bin = '';
-    for (let i = 0; i < rgba.length; i++) bin += String.fromCharCode(rgba[i]);
-    return btoa(bin);
+    return toBase64(rgba);
   }
 }
 
@@ -258,7 +280,10 @@ export class Inpainter {
       // PConv path: read image pixels → run model → write output
       outputUri = await this.runPConv(imageUri, mask, cfg);
     } else {
-      // Telea / NS path: delegate to native OpenCV
+      // Telea / NS path: delegate to native OpenCVProcessor
+      if (!this.opencv.isAvailable()) {
+        throw new Error('[Inpainter] NativeModules.OpenCVProcessor is not available');
+      }
       outputUri = await this.opencv.inpaint(imageUri, mask, { ...cfg, method: effectiveMethod as 'telea' | 'ns' });
     }
 

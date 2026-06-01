@@ -12,8 +12,13 @@ jest.mock('react-native', () => ({
       isModelAvailable: jest.fn().mockResolvedValue(true),
       detectText: jest.fn().mockResolvedValue([]),
     },
+    // Legacy name — kept for any remaining OpenCVInpaint references
     OpenCVInpaint: {
       inpaint: jest.fn().mockResolvedValue('file://output/result.jpg'),
+    },
+    // Track 3: unified OpenCV bridge (inpaint + blend)
+    OpenCVProcessor: {
+      processImage: jest.fn().mockResolvedValue('file://output/opencv_result.jpg'),
     },
   },
   Platform: { OS: 'android' },
@@ -130,8 +135,11 @@ describe('EnsembleDetector', () => {
   it('handles empty detection array gracefully', async () => {
     const { NativeModules } = require('react-native');
     NativeModules.MLKitTextDetection.detectText.mockResolvedValueOnce([]);
-    // warmUp not needed here since EAST is mocked
-    const results = []; // simulate zero results
+    
+    const results = await detector.detect('file://test.jpg', 640, 480, {
+      enableEastFallback: false,
+    });
+    
     expect(results).toHaveLength(0);
   });
 
