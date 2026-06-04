@@ -29,6 +29,16 @@ Pillow==9.5.0
 torch==2.5.1
 torchvision==0.20.1
 
+# ── Phase 2: API server ───────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # required for FastAPI UploadFile / multipart form-data
+
+# ── Phase 2: mDNS advertisement (optional) ────────────────────────────────────
+# Allows the mobile app to discover this server automatically on the LAN.
+# The server runs fine without this — mobile manual URL or emulator mode still work.
+zeroconf>=0.132.2
+
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest>=8.0
 pytest-benchmark>=4.0   # optional: for benchmarking pipeline stages

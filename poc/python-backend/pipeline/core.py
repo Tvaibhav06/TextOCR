@@ -361,6 +361,13 @@ class LaMaInpainter:
                 pil_mask = PILImage.fromarray(mask.data)
                 result   = self._lama(pil_img, pil_mask)
                 bgr      = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+                
+                # LaMa internally pads to a multiple of 8, so we must restore the exact
+                # original dimensions before quality assessment to prevent shape mismatches.
+                h, w = image.shape[:2]
+                if bgr.shape[:2] != (h, w):
+                    bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
+
                 return bgr, 'lama'
             except Exception as e:
                 print(f'[LaMaInpainter] LaMa failed ({e}), falling back to Telea.')

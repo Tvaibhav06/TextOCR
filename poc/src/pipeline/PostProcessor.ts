@@ -231,3 +231,55 @@ export const poissonBlender = {
 
 export const nativeImageProcessor = new NativeImageProcessor();
 export const qualityAssessor       = new QualityAssessor();
+
+// ─── Pixel Extraction (Skia) ──────────────────────────────────────────────────
+
+import { Skia, ColorType, AlphaType, PaintStyle } from '@shopify/react-native-skia';
+
+/**
+ * Extracts raw RGBA pixels from a local image URI using an offscreen Skia surface.
+ * This solves the POC limitation and allows real SSIM math.
+ */
+export async function getImagePixels(uri: string, width: number, height: number): Promise<Uint8Array | null> {
+  try {
+    const data = await Skia.Data.fromURI(uri);
+    const img = Skia.Image.MakeImageFromEncoded(data);
+    if (!img) {
+      console.warn('[PostProcessor] Skia failed to decode image data');
+      return null;
+    }
+
+    const surface = Skia.Surface.Make(width, height);
+    if (!surface) {
+      console.warn('[PostProcessor] Skia failed to create offscreen surface');
+      return null;
+    }
+
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+    paint.setStyle(PaintStyle.Fill);
+
+    // Draw the image scaled to the target dimensions
+    canvas.drawImageRect(
+      img,
+      { x: 0, y: 0, width: img.width(), height: img.height() },
+      { x: 0, y: 0, width, height },
+      paint
+    );
+    surface.flush();
+
+    const snapshot = surface.makeImageSnapshot();
+    const pixels = snapshot.readPixels(0, 0, {
+      width,
+      height,
+      colorType: ColorType.RGBA_8888,
+      alphaType: 1, // Opaque
+    });
+
+    return pixels ? new Uint8Array(pixels) : null;
+  } catch (err) {
+    console.warn('[PostProcessor] getImagePixels failed:', err);
+    return null;
+  }
+}
+

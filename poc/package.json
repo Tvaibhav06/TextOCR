@@ -20,6 +20,7 @@
     "@shopify/react-native-skia": "^0.1.221",
     "axios": "^1.6.8",
     "expo": "~50.0.0",
+    "expo-file-system": "^16.0.9",
     "expo-image-manipulator": "^11.8.0",
     "expo-image-picker": "^14.7.1",
     "expo-media-library": "^15.9.1",
@@ -31,6 +32,7 @@
     "react-native-mmkv": "^2.12.2",
     "react-native-reanimated": "~3.6.2",
     "react-native-vision-camera": "^4.3.2",
+    "react-native-zeroconf": "^0.13.8",
     "zustand": "^4.5.2"
   },
   "devDependencies": {
