@@ -42,6 +42,13 @@ export interface PipelineInput {
   inpaintMethod?: 'telea' | 'ns' | 'pconv';
   enablePoisson?: boolean;
   poissonIterations?: number;
+  /**
+   * Manual compute override — set by the user on the Result screen.
+   * 'mobile' — force local-only result (skip backend even if quality is low).
+   * 'pc'     — force backend upload (skip mobile quality check).
+   * undefined — use automatic SSIM/coverage-based decision (default).
+   */
+  forceMode?: 'mobile' | 'pc';
 }
 
 export interface StageMetrics {
@@ -213,7 +220,7 @@ export class TextRemovalPipeline {
 
     let quality;
     if (origPixels && resultPixels) {
-      quality = qualityAssessor.assess(origPixels, resultPixels, mask, 0.82);
+      quality = qualityAssessor.assess(origPixels, resultPixels, mask, 0.70);
     } else {
       console.warn('[Pipeline] Failed to extract pixels, forcing low SSIM to trigger backend.');
       quality = { ssim: 0.65, psnr: 22.4, mse: 0.05, aboveThreshold: false };
@@ -224,10 +231,21 @@ export class TextRemovalPipeline {
     console.log(`[Pipeline] Stage 4 ✓ — SSIM=${quality.ssim.toFixed(3)} in ${Math.round(performance.now() - ts)}ms`);
 
     // ── Phase 2: Quality gate → backend fallback ────────────────────────────────
-    // Trigger when: SSIM < 0.82  OR  mask coverage > 25%
+    // Default: trigger when SSIM < 0.70  OR  mask coverage > 25%.
+    // forceMode overrides: 'mobile' = never upload, 'pc' = always upload.
     // We use the original imageUri (not the locally inpainted one) for maximum
     // quality on the server side.
-    const needsServerUpgrade = !quality.aboveThreshold || mask.coverage > 0.25;
+    let needsServerUpgrade: boolean;
+    if (input.forceMode === 'mobile') {
+      needsServerUpgrade = false;
+      console.log('[Pipeline] forceMode=mobile — skipping backend upload.');
+    } else if (input.forceMode === 'pc') {
+      needsServerUpgrade = true;
+      console.log('[Pipeline] forceMode=pc — forcing backend upload.');
+    } else {
+      // Automatic quality-based decision
+      needsServerUpgrade = !quality.aboveThreshold || mask.coverage > 0.25;
+    }
     let backendMeta: PipelineResult['backend'] = undefined;
 
     if (needsServerUpgrade) {

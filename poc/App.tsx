@@ -134,15 +134,16 @@ export default function App() {
     }
   };
 
-  const runPipeline = async () => {
+  const runPipeline = async (forceMode?: 'mobile' | 'pc') => {
     if (!s.sourceUri) return;
     tokenRef.current?.cancel();
     const token = new CancellationToken();
     tokenRef.current = token;
 
+    const modeLabel = forceMode === 'mobile' ? '📱 Mobile Only…' : forceMode === 'pc' ? '⚡ PC Server…' : 'Starting…';
     setS(prev => ({
       ...prev, phase: 'processing',
-      stage: 'detecting', progress: 0, stageMsg: 'Starting…', error: null,
+      stage: 'detecting', progress: 0, stageMsg: modeLabel, error: null,
     }));
 
     const onProgress = (p: PipelineProgress) => {
@@ -152,7 +153,7 @@ export default function App() {
 
     try {
       const result = await pipeline.run(
-        { imageUri: s.sourceUri, imageWidth: s.imgW, imageHeight: s.imgH },
+        { imageUri: s.sourceUri, imageWidth: s.imgW, imageHeight: s.imgH, forceMode },
         onProgress,
         token,
       );
@@ -297,7 +298,7 @@ export default function App() {
       {/* Bottom Floating Bar */}
       <FloatingActionBar>
         <ActionButton id="btn-repick" icon="✕" label="Back" onPress={reset} />
-        <ActionButton id="btn-run" icon="✨" label="Remove Text" onPress={runPipeline} primary />
+        <ActionButton id="btn-run" icon="✨" label="Remove Text" onPress={() => runPipeline()} primary />
       </FloatingActionBar>
     </View>
   );
@@ -327,40 +328,44 @@ export default function App() {
   );
 
   const renderResult = () => (
-    <View style={styles.editorContainer}>
-      {/* Top Toggle Pill (Like Google Translate Language Swap) */}
-      <View style={styles.floatingTopToggle}>
-        <Pressable
-          id="btn-before"
-          style={[styles.toggleBtn, s.showBefore && styles.toggleBtnActive]}
-          onPress={() => setS(prev => ({ ...prev, showBefore: true }))}
-        >
-          <Text style={[styles.toggleBtnText, s.showBefore && styles.toggleBtnTextActive]}>Before</Text>
-        </Pressable>
-        <View style={styles.toggleDivider} />
-        <Pressable
-          id="btn-after"
-          style={[styles.toggleBtn, !s.showBefore && styles.toggleBtnActive]}
-          onPress={() => setS(prev => ({ ...prev, showBefore: false }))}
-        >
-          <Text style={[styles.toggleBtnText, !s.showBefore && styles.toggleBtnTextActive]}>After</Text>
-        </Pressable>
+    <View style={styles.resultContainer}>
+      {/* Toggle pill — sits right at the top, no floating gap */}
+      <View style={styles.resultToggleRow}>
+        <View style={styles.resultToggle}>
+          <Pressable
+            id="btn-before"
+            style={[styles.toggleBtn, s.showBefore && styles.toggleBtnActive]}
+            onPress={() => setS(prev => ({ ...prev, showBefore: true }))}
+          >
+            <Text style={[styles.toggleBtnText, s.showBefore && styles.toggleBtnTextActive]}>Before</Text>
+          </Pressable>
+          <View style={styles.toggleDivider} />
+          <Pressable
+            id="btn-after"
+            style={[styles.toggleBtn, !s.showBefore && styles.toggleBtnActive]}
+            onPress={() => setS(prev => ({ ...prev, showBefore: false }))}
+          >
+            <Text style={[styles.toggleBtnText, !s.showBefore && styles.toggleBtnTextActive]}>After</Text>
+          </Pressable>
+        </View>
       </View>
 
+      {/* Image fills all remaining space between toggle and bottom sheet */}
       <Image
         source={{ uri: s.showBefore ? s.sourceUri! : s.resultUri! }}
-        style={styles.fullScreenImage}
+        style={styles.resultImage}
         resizeMode="contain"
       />
 
-      <View style={styles.bottomSheetContainer}>
-        <ResultBottomSheet
-          result={s.result!}
-          onSave={saveResult}
-          onRetry={reset}
-          onOpenSettings={openSettings}
-        />
-      </View>
+      {/* Bottom sheet — fixed at bottom, never overlaps image */}
+      <ResultBottomSheet
+        result={s.result!}
+        onSave={saveResult}
+        onRetry={reset}
+        onOpenSettings={openSettings}
+        onForceMobile={() => runPipeline('mobile')}
+        onForceServer={() => runPipeline('pc')}
+      />
     </View>
   );
 
@@ -524,8 +529,32 @@ const styles = StyleSheet.create({
     width: '100%',
   },
 
-  // Result specific
+  // Result specific — flex column layout: toggle → image → bottom sheet
+  resultContainer: {
+    flex: 1,
+    flexDirection: 'column',
+    backgroundColor: Theme.colors.background,
+  },
+  resultToggleRow: {
+    paddingTop: Theme.spacing.sm,
+    paddingBottom: Theme.spacing.sm,
+    alignItems: 'center',
+    backgroundColor: Theme.colors.background,
+  },
+  resultToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: Theme.colors.surface,
+    borderRadius: Theme.radius.round,
+    padding: 4,
+    ...Theme.shadows.sm,
+  },
+  resultImage: {
+    flex: 1,
+    width: '100%',
+  },
   floatingTopToggle: {
+    // kept for reference but replaced by resultToggle in result screen
     position: 'absolute',
     top: Theme.spacing.xl,
     alignSelf: 'center',

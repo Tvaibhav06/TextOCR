@@ -9,9 +9,15 @@ interface ResultBottomSheetProps {
   onSave: () => void;
   onRetry: () => void;
   onOpenSettings: () => void;
+  /**
+   * Manual compute override handlers.
+   * Easy to remove: just delete these two props and the Override row below.
+   */
+  onForceMobile: () => void;
+  onForceServer: () => void;
 }
 
-export function ResultBottomSheet({ result, onSave, onRetry, onOpenSettings }: ResultBottomSheetProps) {
+export function ResultBottomSheet({ result, onSave, onRetry, onOpenSettings, onForceMobile, onForceServer }: ResultBottomSheetProps) {
   const [showTimings, setShowTimings] = useState(false);
 
   const { quality, backend, timing, detections } = result;
@@ -71,6 +77,32 @@ export function ResultBottomSheet({ result, onSave, onRetry, onOpenSettings }: R
         <ActionButton id="btn-save" icon="💾" label="Save" onPress={onSave} primary />
         <ActionButton id="btn-retry" icon="✕" label="Close" onPress={onRetry} />
       </View>
+
+      {/* ── Manual Compute Override Row ────────────────────────────────────────
+         Easy to remove: delete this entire block + overrideRow / overrideBtn styles.
+         Shown when: result is already available, allowing user to switch compute path. */}
+      <View style={styles.overrideRow}>
+        {backend?.used ? (
+          // Result came from PC server → offer mobile re-run
+          <Pressable
+            id="btn-force-mobile"
+            style={styles.overrideBtn}
+            onPress={onForceMobile}
+          >
+            <Text style={styles.overrideBtnText}>📱 Recompute Locally (Mobile)</Text>
+          </Pressable>
+        ) : (
+          // Result came from mobile → offer PC server re-run
+          <Pressable
+            id="btn-force-server"
+            style={styles.overrideBtn}
+            onPress={onForceServer}
+          >
+            <Text style={styles.overrideBtnText}>⚡ Enhance on Server (PC)</Text>
+          </Pressable>
+        )}
+      </View>
+      {/* ── End Manual Compute Override Row ────────────────────────────────── */}
     </View>
   );
 }
@@ -81,7 +113,7 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: Theme.radius.lg,
     borderTopRightRadius: Theme.radius.lg,
     padding: Theme.spacing.lg,
-    paddingBottom: Theme.spacing.xxl, // safe area padding
+    paddingBottom: Theme.spacing.lg,
     width: '100%',
     ...Theme.shadows.lg,
   },
@@ -182,5 +214,19 @@ const styles = StyleSheet.create({
     width: 45,
     ...Theme.typography.caption,
     textAlign: 'right',
+  },
+  // ── Manual Compute Override Row styles (easy to remove together with the UI block above) ──
+  overrideRow: {
+    marginTop: Theme.spacing.sm,
+    alignItems: 'center',
+  },
+  overrideBtn: {
+    paddingVertical: Theme.spacing.sm,
+    paddingHorizontal: Theme.spacing.md,
+  },
+  overrideBtnText: {
+    ...Theme.typography.caption,
+    color: Theme.colors.primary,
+    textDecorationLine: 'underline',
   },
 });
