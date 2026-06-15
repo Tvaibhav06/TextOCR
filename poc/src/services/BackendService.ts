@@ -349,6 +349,165 @@ class BackendService {
   }
 
   /**
+   * Upload the ORIGINAL image to the PC server for a full Stages 1–7 translation pipeline.
+   * The server runs: PaddleOCR detection → LaMa inpainting → PaddleOCR Stage 5 → translation → render.
+   * Returns a file:// URI of the final fully-rendered translated JPEG.
+   *
+   * This is the PC fallback for the translation path (Stages 5–7 on server).
+   *
+   * @param originalImageUri  file:// URI of the ORIGINAL (pre-pipeline) image.
+   * @param targetLang        BCP-47 target language code (e.g. "hi", "de").
+   * @param baseUrl           Resolved backend URL (from resolveUrl()).
+   * @param origWidth         Original image width in pixels.
+   * @param origHeight        Original image height in pixels.
+   */
+  async processTranslate(
+    originalImageUri: string,
+    targetLang:       string,
+    baseUrl:          string,
+    origWidth:        number = 0,
+    origHeight:       number = 0,
+    existingDetections?: any[],
+    existingOcrResults?: any[],
+  ): Promise<{
+    resultUri:       string;
+    totalMs:         number;
+    detections:      number;
+    translations:    number;
+    pcTranslatedTexts?: string[];
+  } | null> {
+    const endpoint = baseUrl.replace(/\/$/, '') + '/api/process-translate';
+
+    // Downscale before upload (same logic as processImage)
+    let uploadUri = originalImageUri;
+    let uploadW = origWidth;
+    let uploadH = origHeight;
+    try {
+      const longestSide = Math.max(origWidth, origHeight);
+      if (longestSide > UPLOAD_MAX_DIM) {
+        const scale = UPLOAD_MAX_DIM / longestSide;
+        uploadW = Math.round(origWidth  * scale);
+        uploadH = Math.round(origHeight * scale);
+        const resized = await ImageManipulator.manipulateAsync(
+          originalImageUri,
+          [{ resize: { width: uploadW, height: uploadH } }],
+          { compress: 0.88, format: ImageManipulator.SaveFormat.JPEG },
+        );
+        uploadUri = resized.uri;
+        console.log(
+          `[BackendService] Translate: downscaled ${origWidth}×${origHeight} → ${uploadW}×${uploadH}`,
+        );
+      }
+    } catch (resizeErr) {
+      console.warn('[BackendService] Translate: resize failed, uploading original:', resizeErr);
+    }
+
+    console.log('[BackendService] Translate: uploading to', endpoint, '→ lang:', targetLang);
+
+    const formData = new FormData();
+    formData.append('image', {
+      uri:  uploadUri,
+      name: 'image.jpg',
+      type: 'image/jpeg',
+    } as any);
+    formData.append('target_lang', targetLang);
+
+    if (existingDetections && existingDetections.length > 0) {
+      try {
+        const regions = [];
+        for (const det of existingDetections) {
+          const ocr = existingOcrResults?.find(o => o.detId === det.id);
+          
+          // Compute pixel coords relative to the uploaded image dimensions
+          const px = Math.round(det.bbox.x * uploadW);
+          const py = Math.round(det.bbox.y * uploadH);
+          const pw = Math.round(det.bbox.width * uploadW);
+          const ph = Math.round(det.bbox.height * uploadH);
+          
+          const poly = det.polygon.points.map((p: any) => [
+            Math.round(p.x * uploadW),
+            Math.round(p.y * uploadH)
+          ]);
+          
+          regions.push({
+            id: det.id,
+            bbox: { x: px, y: py, w: pw, h: ph },
+            polygon: poly,
+            text: ocr ? ocr.text : "",
+            confidence: ocr ? ocr.confidence : det.confidence,
+            skip: ocr ? ocr.skip : true
+          });
+        }
+        const payload = { version: 1, regions };
+        formData.append('regions_json', encodeURIComponent(JSON.stringify(payload)));
+        console.log(`[BackendService] Translate: sending ${regions.length} injected regions.`);
+      } catch (err) {
+        console.warn('[BackendService] Failed to serialize regions_json:', err);
+      }
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+
+    try {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        body:   formData,
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '(no body)');
+        console.error(`[BackendService] Translate server error ${resp.status}: ${errText}`);
+        return null;
+      }
+
+      // Server returns JSON: { image_b64, translated_texts[], total_ms, detections, translations }
+      const json = await resp.json();
+
+      const totalMs:           number   = parseFloat(json.total_ms   ?? 0);
+      const detections:        number   = parseInt(json.detections   ?? 0, 10);
+      const translations:      number   = parseInt(json.translations ?? 0, 10);
+      const pcTranslatedTexts: string[] = Array.isArray(json.translated_texts) ? json.translated_texts : [];
+      const image_b64:         string   = json.image_b64 ?? '';
+
+      console.log(`[BackendService] Translate result: ${translations}/${detections} regions  ${totalMs}ms`);
+      console.log(`[BackendService] Translated texts:`, pcTranslatedTexts);
+
+      if (!image_b64) {
+        console.error('[BackendService] Translate: no image_b64 in response');
+        return null;
+      }
+
+      // Save base64 image to cache as a JPEG file
+      const FileSystem = await import('expo-file-system').catch(() => null);
+      if (!FileSystem) {
+        console.warn('[BackendService] expo-file-system not available.');
+        return null;
+      }
+      const filename  = `translate_result_${Date.now()}.jpg`;
+      const cacheDir  = FileSystem.cacheDirectory ?? 'file:///data/data/com.textremover/cache/';
+      const resultUri = cacheDir + filename;
+      await FileSystem.writeAsStringAsync(resultUri, image_b64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      console.log('[BackendService] Translate result saved to cache:', resultUri);
+
+      return { resultUri, totalMs, detections, translations, pcTranslatedTexts };
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        console.error(`[BackendService] Translate timed out (${UPLOAD_TIMEOUT_MS / 1000}s).`);
+      } else {
+        console.error('[BackendService] Translate upload failed:', err);
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+
+  }
+
+  /**
    * Save a Blob to the device cache directory and return its file:// URI.
    * Uses expo-file-system.
    */

@@ -33,3 +33,4 @@ Thumbs.db
 debug.keystore
 .cxx/
 .idea/
+*.log

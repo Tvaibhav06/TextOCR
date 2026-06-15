@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from pipeline.core import (
     BBox, Detection, MaskResult,
-    MSERDetector, MaskGenerator, OpenCVInpainter,
+    MSERDetector, MaskGenerator, LaMaInpainter,
     QualityAssessor, TextRemovalPipeline,
 )
 
@@ -124,23 +124,23 @@ class TestMaskGenerator:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SUITE 3: OpenCVInpainter
+# SUITE 3: LaMaInpainter
 # ════════════════════════════════════════════════════════════════════════════
 
-class TestOpenCVInpainter:
-    INP = OpenCVInpainter()
+class TestLaMaInpainter:
+    INP = LaMaInpainter()
 
     def test_output_shape_matches_input(self, image_with_text, simple_mask):
-        result = self.INP.inpaint(image_with_text, simple_mask, radius=5, method='telea')
+        result, _ = self.INP.inpaint(image_with_text, simple_mask, radius=5, method='telea')
         assert result.shape == image_with_text.shape
 
     def test_output_dtype_is_uint8(self, image_with_text, simple_mask):
-        result = self.INP.inpaint(image_with_text, simple_mask, radius=5, method='telea')
+        result, _ = self.INP.inpaint(image_with_text, simple_mask, radius=5, method='telea')
         assert result.dtype == np.uint8
 
     @pytest.mark.parametrize("method", ["telea", "ns"])
     def test_both_methods_produce_valid_output(self, image_with_text, simple_mask, method):
-        result = self.INP.inpaint(image_with_text, simple_mask, radius=5, method=method)
+        result, _ = self.INP.inpaint(image_with_text, simple_mask, radius=5, method=method)
         assert result is not None
         assert not np.all(result == 0)
 
@@ -149,7 +149,7 @@ class TestOpenCVInpainter:
         mask_data = np.zeros((480, 640), dtype=np.uint8)
         mask_data[100:120, 100:400] = 255
         mask = MaskResult(mask_data, mask_data.mean()/255, int((mask_data>0).sum()))
-        result = self.INP.inpaint(gradient_image, mask, radius=5, method='telea')
+        result, _ = self.INP.inpaint(gradient_image, mask, radius=5, method='telea')
         outside = mask_data == 0
         np.testing.assert_array_equal(result[outside], gradient_image[outside])
 
@@ -165,7 +165,7 @@ class TestOpenCVInpainter:
         from pipeline.core import MaskResult, QualityAssessor
         mask = MaskResult(mask_data, mask_data.mean()/255, int((mask_data>0).sum()))
         # Inpaint
-        result = self.INP.inpaint(img_text, mask, radius=5, method='telea')
+        result, _ = self.INP.inpaint(img_text, mask, radius=5, method='telea')
         # Score with our own QualityAssessor (no external dep)
         qa = QualityAssessor()
         metrics = qa.assess(gradient_image, result, mask, threshold=0.90)
@@ -255,7 +255,7 @@ class TestFullPipeline:
         This test would have caught that bug.
         """
         result = pipeline.run(image_with_text)
-        stage_keys = [k for k in result.timing if k != 'total_ms']
+        stage_keys = [k for k in result.timing if k != 'total_ms' and isinstance(result.timing[k], (int, float))]
         expected   = round(sum(result.timing[k] for k in stage_keys), 1)
         assert result.timing['total_ms'] == pytest.approx(expected, abs=1.0)
 

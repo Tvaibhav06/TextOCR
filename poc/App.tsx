@@ -3,15 +3,15 @@
  * Google Translate Refactored Style
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react'; // Force Fast Refresh reload
 import {
   Alert,
   Animated,
   Dimensions,
   Image,
+  NativeModules,
   Pressable,
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -36,7 +36,15 @@ import { TopBar } from './src/components/TopBar';
 import { FloatingActionBar, ActionButton } from './src/components/FloatingActionBar';
 import { ProgressCard } from './src/components/ProgressCard';
 import { ResultBottomSheet } from './src/components/ResultBottomSheet';
+import { TranslationService, type TranslationSession } from './src/services/TranslationService';
+import { TranslatedOverlay } from './src/pipeline/translation/SkiaRenderer';
 import { SettingsModal } from './src/components/SettingsModal';
+import { FEATURES } from './src/config/features';
+
+const DEBUG_MODULES = () => {
+  console.log('Available NativeModules:', Object.keys(NativeModules).filter(n => n.toLowerCase().includes('mlkit') || n.toLowerCase().includes('translate')));
+};
+DEBUG_MODULES();
 
 const { width: SW, height: SH } = Dimensions.get('window');
 
@@ -57,24 +65,37 @@ interface AppState {
   showBefore: boolean;
   showSettings: boolean;
   manualUrl: string;
+
+  // Translation State
+  translationSession: TranslationSession | null;
+  isTranslating: boolean;
+  translationStage: string;  // live status message while translating
+  targetLang: string;
+  /** Stage 7 mobile render coverage — set by onRenderComplete callback. */
+  renderCoverage: number | null;
 }
 
-const INIT: AppState = {
+const initialState: AppState = {
   phase: 'idle', sourceUri: null, resultUri: null,
   imgW: 1, imgH: 1, stage: 'idle',
   progress: 0, stageMsg: '', result: null,
   error: null, showBefore: true,
   showSettings: false,
   manualUrl: backendService.getManualUrl() ?? '',
+  translationSession: null,
+  isTranslating: false,
+  translationStage: '',
+  targetLang: 'hi',
+  renderCoverage: null,
 };
 
 export default function App() {
-  const [s, setS] = useState<AppState>(INIT);
+  const [s, setS] = useState<AppState>(initialState);
   const tokenRef = useRef<CancellationToken | null>(null);
   const progressAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    pipeline.warmUp().catch(() => {});
+    pipeline.warmUp().catch(() => { });
     return () => { tokenRef.current?.cancel(); };
   }, []);
 
@@ -167,15 +188,59 @@ export default function App() {
         result,
         showBefore: false,
       }));
-    } catch (err: any) {
-      if (token.isCancelled) return;
-      const errorMessage = err?.message ?? 'Pipeline failed. Check logcat for details.';
+    } catch (e: any) {
+      console.error(e);
+      Alert.alert('Pipeline Failed', e.message);
+      setS(prev => ({ ...prev, phase: 'editor' }));
+    }
+  };
+
+  const runTranslation = async (forceMode?: 'mobile' | 'pc') => {
+    if (!s.result || s.isTranslating) return;
+
+    // Pass existing mobile OCR results if they exist (to bypass PC detection/OCR)
+    const existingOcrResults = s.translationSession?.mobileData?.ocrResults;
+
+    setS(prev => ({ ...prev, isTranslating: true, translationStage: 'Starting…', translationSession: null, renderCoverage: null }));
+
+    const onProgress = (stage: string, detail?: string) => {
+      setS(prev => ({ ...prev, translationStage: detail ?? stage }));
+    };
+
+    try {
+
+      const session = await TranslationService.run(
+        s.result,
+        s.targetLang,
+        onProgress,
+        forceMode,
+        existingOcrResults,
+      );
+
+      // --- TEMP POPUP FOR TESTING STAGE 5 & 6 ---
+      let translatedTexts = '';
+      if (session.path === 'mobile' && session.mobileData) {
+        translatedTexts = session.mobileData.translationResults.map(r => r.text).join('\n');
+      } else if (session.pcTranslatedTexts && session.pcTranslatedTexts.length > 0) {
+        translatedTexts = session.pcTranslatedTexts.join('\n');
+      } else {
+        translatedTexts = 'Translation succeeded (empty)';
+      }
+      Alert.alert('Translated Text (Stages 5 & 6)', translatedTexts);
+      // ------------------------------------------
+
       setS(prev => ({
         ...prev,
-        phase: 'editor',
-        stage: 'idle',
-        error: errorMessage,
+        translationSession: session,
+        isTranslating: false,
+        translationStage: '',
+        // For PC path: update resultUri to the server-rendered image
+        resultUri: session.path === 'pc' ? session.outputUri : prev.resultUri,
       }));
+    } catch (e: any) {
+      console.error('Translation error:', e);
+      Alert.alert('Translation Failed', e.message);
+      setS(prev => ({ ...prev, isTranslating: false, translationStage: '' }));
     }
   };
 
@@ -197,7 +262,7 @@ export default function App() {
 
   const reset = () => {
     tokenRef.current?.cancel();
-    setS(INIT);
+    setS(initialState);
   };
 
   // Phase 2 Settings helpers
@@ -238,7 +303,7 @@ export default function App() {
     <View style={styles.idleContainer}>
       <View style={styles.idleTopHalf}>
         <TopBar title="TextRemover" onSettingsPress={openSettings} />
-        
+
         <View style={styles.idleHeroContent}>
           <Text style={styles.idleHeroTitle}>TextRemover</Text>
           <Text style={styles.idleHeroDesc}>
@@ -351,11 +416,38 @@ export default function App() {
       </View>
 
       {/* Image fills all remaining space between toggle and bottom sheet */}
-      <Image
-        source={{ uri: s.showBefore ? s.sourceUri! : s.resultUri! }}
-        style={styles.resultImage}
-        resizeMode="contain"
-      />
+      <View style={styles.resultImageContainer}>
+        {FEATURES.STAGE7_MOBILE_ENABLED
+          && s.translationSession?.path === 'mobile'
+          && s.translationSession.mobileData
+          && !s.showBefore ? (
+          // Stage 7 Mobile: SkiaRenderer overlays translated text on the inpainted image
+          <TranslatedOverlay
+            inpaintedUri={s.translationSession.outputUri}
+            originalUri={s.translationSession.originalUri}
+            imageWidth={s.translationSession.mobileData.imageWidth}
+            imageHeight={s.translationSession.mobileData.imageHeight}
+            ocrResults={s.translationSession.mobileData.ocrResults}
+            translationResults={s.translationSession.mobileData.translationResults}
+            targetLang={s.translationSession.targetLang}
+            onRenderComplete={(rendered, total) => {
+              console.log(`[App] Stage 7 render complete: ${rendered}/${total} regions`);
+              setS(prev => {
+                const cov = total > 0 ? rendered / total : 1;
+                if (prev.renderCoverage === cov) return prev; // Break the re-render cycle
+                return { ...prev, renderCoverage: cov };
+              });
+            }}
+          />
+        ) : (
+          // Default: show result image (erase-only, or PC-rendered translation)
+          <Image
+            source={{ uri: s.showBefore ? s.sourceUri! : s.resultUri! }}
+            style={styles.resultImage}
+            resizeMode="contain"
+          />
+        )}
+      </View>
 
       {/* Bottom sheet — fixed at bottom, never overlaps image */}
       <ResultBottomSheet
@@ -365,6 +457,15 @@ export default function App() {
         onOpenSettings={openSettings}
         onForceMobile={() => runPipeline('mobile')}
         onForceServer={() => runPipeline('pc')}
+        onTranslate={() => runTranslation()}
+        onForceTranslateMobile={() => runTranslation('mobile')}
+        onForceTranslateServer={() => runTranslation('pc')}
+        isTranslating={s.isTranslating}
+        translationStage={s.translationStage}
+        targetLang={s.targetLang}
+        onTargetLangChange={(lang) => setS(prev => ({ ...prev, targetLang: lang }))}
+        translationSession={s.translationSession}
+        renderCoverage={s.renderCoverage}
       />
     </View>
   );
@@ -375,7 +476,7 @@ export default function App() {
         barStyle={s.phase === 'idle' ? 'light-content' : 'dark-content'}
         backgroundColor={s.phase === 'idle' ? Theme.colors.primary : Theme.colors.background}
       />
-      
+
       {s.phase === 'idle' && renderIdle()}
       {s.phase === 'editor' && renderEditor()}
       {s.phase === 'processing' && renderProcessing()}
@@ -400,7 +501,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Theme.colors.background,
   },
-  
+
   // Idle State
   idleContainer: {
     flex: 1,
@@ -548,6 +649,10 @@ const styles = StyleSheet.create({
     borderRadius: Theme.radius.round,
     padding: 4,
     ...Theme.shadows.sm,
+  },
+  resultImageContainer: {
+    flex: 1,
+    width: '100%',
   },
   resultImage: {
     flex: 1,

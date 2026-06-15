@@ -60,6 +60,9 @@ export interface StageMetrics {
 
 export interface PipelineResult {
   outputUri: string;
+  originalUri?: string;
+  width?: number;
+  height?: number;
   maskResult: MaskResult;
   detections: DetectionResult[];
   quality: {
@@ -303,6 +306,9 @@ export class TextRemovalPipeline {
 
     return {
       outputUri: finalUri,
+      originalUri: input.imageUri,
+      width: input.imageWidth,
+      height: input.imageHeight,
       maskResult: mask,
       detections,
       quality: {
@@ -318,6 +324,7 @@ export class TextRemovalPipeline {
   private buildNoTextResult(imageUri: string, t0: number): PipelineResult {
     return {
       outputUri: imageUri,
+      originalUri: imageUri,
       maskResult: { data: new Uint8Array(0), width: 0, height: 0, maskedPixels: 0, coverage: 0 },
       detections: [],
       quality: { ssim: 1, psnr: Infinity, aboveThreshold: true, suggestServerUpgrade: false },

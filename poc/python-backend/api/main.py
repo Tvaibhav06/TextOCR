@@ -23,12 +23,12 @@ import logging
 import sys
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager # Force uvicorn reload
 
 import cv2
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -49,7 +49,7 @@ _BACKEND_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
-from pipeline.core import TextRemovalPipeline  # noqa: E402
+from pipeline.core import TextRemovalPipeline, Detection, BBox, PipelineResult  # noqa: E402
 
 # ── Lazy pipeline singleton ────────────────────────────────────────────────────
 _pipeline: TextRemovalPipeline | None = None
@@ -62,6 +62,34 @@ def get_pipeline() -> TextRemovalPipeline:
         _pipeline = TextRemovalPipeline(lang="en", use_gpu=False)
         log.info("Pipeline ready.")
     return _pipeline
+
+_ocr = None
+_translator = None
+_renderer = None
+
+def get_ocr():
+    global _ocr
+    if _ocr is None:
+        log.info("Initialising RegionOCR…")
+        from pipeline.ocr import RegionOCR
+        _ocr = RegionOCR()
+    return _ocr
+
+def get_translator():
+    global _translator
+    if _translator is None:
+        log.info("Initialising TranslationRouter…")
+        from pipeline.translation import TranslationRouter
+        _translator = TranslationRouter()
+    return _translator
+
+def get_renderer():
+    global _renderer
+    if _renderer is None:
+        log.info("Initialising TextRenderer…")
+        from pipeline.renderer import TextRenderer
+        _renderer = TextRenderer()
+    return _renderer
 
 
 # ── mDNS advertisement (optional — graceful if zeroconf not installed) ────────
@@ -141,6 +169,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-TotalMs", "X-Detections", "X-Translations", "X-Translated-Texts", "X-SSIM", "X-PSNR", "X-Coverage", "X-InpaintTier"],
 )
 
 
@@ -274,3 +303,204 @@ async def process_image(image: UploadFile = File(...)):
         media_type="image/jpeg",
         headers=headers,
     )
+
+
+@app.post("/api/process-translate", summary="Remove text and replace with translation")
+async def process_translate_image(
+    image: UploadFile = File(...),
+    target_lang: str = Form("en"),
+    regions_json: str = Form(None),
+):
+    """
+    Full Phase 3 pipeline: Erase text + Translate + Re-render.
+    
+    Processing:
+      1. Stages 1-4: PaddleOCR detection + LaMa inpainting.
+      2. Stage 5:    Tesseract OCR on detected regions from original image.
+      3. Stage 6:    IndicTrans2 / Argos Translate to target_lang.
+      4. Stage 7:    TextRenderer overlay with matched fonts & BiDi.
+    """
+    log.info(
+        "Process-Translate request: file=%r target_lang=%r",
+        image.filename,
+        target_lang,
+    )
+
+    raw_bytes = await image.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+
+    arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="Invalid image.")
+
+    try:
+        t_start = time.perf_counter()
+        encoded_texts = "[]"
+        
+        injected_detections = None
+        injected_ocr_results = None
+        
+        if regions_json:
+            import json
+            import urllib.parse
+            from pipeline.ocr import OcrResult
+            try:
+                data = json.loads(urllib.parse.unquote(regions_json))
+                if not isinstance(data, dict): raise ValueError("payload must be dict")
+                if data.get("version") != 1: raise ValueError("unsupported version")
+                regions = data.get("regions")
+                if not isinstance(regions, list): raise ValueError("regions must be a list")
+                
+                valid_detections = []
+                valid_ocr = []
+                for r in regions:
+                    r_id = int(r["id"])
+                    bbox = r["bbox"]
+                    x, y, w, h = int(bbox["x"]), int(bbox["y"]), int(bbox["w"]), int(bbox["h"])
+                    if w <= 0 or h <= 0: raise ValueError("invalid bbox dimensions")
+                    
+                    poly_list = r.get("polygon")
+                    if poly_list and isinstance(poly_list, list) and len(poly_list) >= 3:
+                        poly = np.array(poly_list, dtype=np.int32)
+                    else:
+                        poly = np.array([
+                            [x, y], [x + w, y], [x + w, y + h], [x, y + h]
+                        ], dtype=np.int32)
+                        
+                    conf = float(r.get("confidence", 1.0))
+                    
+                    det = Detection(
+                        id=r_id,
+                        bbox=BBox(x, y, w, h),
+                        polygon=poly,
+                        confidence=conf,
+                        source="injected"
+                    )
+                    valid_detections.append(det)
+                    
+                    text = r.get("text", "")
+                    skip_flag = r.get("skip", False)
+                    if text and isinstance(text, str) and text.strip():
+                        valid_ocr.append({
+                            "has_text": True,
+                            "obj": OcrResult(
+                                det_id=r_id, text=text, confidence=conf,
+                                skip=skip_flag, x=x, y=y, w=w, h=h
+                            )
+                        })
+                    else:
+                        valid_ocr.append({
+                            "has_text": True,
+                            "obj": OcrResult(
+                                det_id=r_id, text="", confidence=conf,
+                                skip=True, x=x, y=y, w=w, h=h
+                            )
+                        })
+                
+                injected_detections = valid_detections
+                injected_ocr_results = valid_ocr
+                log.info("[Injection] Successfully parsed %d regions from mobile.", len(valid_detections))
+                
+            except Exception as e:
+                log.warning("[Injection] Failed to parse regions_json: %s. Falling back to full pipeline.", e)
+                injected_detections = None
+                injected_ocr_results = None
+
+        pipe = get_pipeline()
+        
+        if injected_detections is not None:
+            # ── Stage 1-4 Bypass ──
+            h_img, w_img = img_bgr.shape[:2]
+            mask = pipe.masker.generate(injected_detections, h_img, w_img, dilation_px=5)
+            inpainted, _ = pipe.inpainter.inpaint(img_bgr, mask, radius=7, method='telea')
+            
+            result = PipelineResult(
+                output=inpainted, mask=mask, detections=injected_detections,
+                quality={}, timing={}, total_ms=0.0
+            )
+        else:
+            # ── Normal Stages 1–4: Erase text ──
+            result = pipe.run(img_bgr)
+        
+        if not result.detections:
+            # Nothing to translate; return original
+            output_bgr = img_bgr
+            translated_count = 0
+        else:
+            # ── Stage 5: OCR text from original image
+            if injected_ocr_results is not None:
+                ocr_engine = get_ocr()
+                ocr_results = []
+                for i, det in enumerate(result.detections):
+                    inj = injected_ocr_results[i]
+                    if inj["has_text"]:
+                        ocr_results.append(inj["obj"])
+                    else:
+                        partial_res = ocr_engine.run(img_bgr, [det])
+                        if partial_res:
+                            ocr_results.append(partial_res[0])
+            else:
+                ocr_engine = get_ocr()
+                ocr_results = ocr_engine.run(img_bgr, result.detections)
+            
+            # ── Stage 6: Translate
+            translator = get_translator()
+            from pipeline.translation import TranslationResult
+            tr_results = []
+            for r in ocr_results:
+                if r.skip:
+                    tr_results.append(TranslationResult(
+                        text=r.text, engine="skipped", src_lang="auto", tgt_lang=target_lang
+                    ))
+                else:
+                    res = translator.translate(r.text, src="en", tgt=target_lang)
+                    tr_results.append(res)
+            
+            # ── Stage 7: Render translated text onto inpainted image
+            renderer = get_renderer()
+            output_bgr = renderer.render_all(
+                original_bgr=img_bgr,
+                inpainted_bgr=result.output,
+                ocr_results=ocr_results,
+                translations=tr_results,
+                target_lang=target_lang
+            )
+            
+            import json, urllib.parse
+            translated_strings = [tr.text for tr in tr_results if tr and tr.engine != "failed" and tr.text]
+            encoded_texts = urllib.parse.quote(json.dumps(translated_strings))
+            
+            translated_count = len(translated_strings)
+
+        elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+
+    except Exception as exc:
+        log.exception("Translate pipeline error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Pipeline failed: {exc}") from exc
+
+    _translated_count = translated_count if 'translated_count' in locals() else 0
+    _encoded_texts    = encoded_texts    if 'encoded_texts'    in locals() else []
+    _detections       = len(result.detections) if 'result' in locals() else 0
+
+    log.info(
+        "Translate done: %d regions translated in %.1fms",
+        _translated_count,
+        elapsed_ms,
+    )
+
+    ok, jpeg_buf = cv2.imencode(".jpg", output_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode result image.")
+
+    import base64
+    image_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+
+    return JSONResponse({
+        "image_b64":        image_b64,
+        "translated_texts": _encoded_texts if isinstance(_encoded_texts, list) else [],
+        "total_ms":         elapsed_ms,
+        "detections":       _detections,
+        "translations":     _translated_count,
+    })

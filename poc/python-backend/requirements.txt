@@ -42,3 +42,14 @@ zeroconf>=0.132.2
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest>=8.0
 pytest-benchmark>=4.0   # optional: for benchmarking pipeline stages
+
+# ── Phase 3 / Stage 7: Font Matching & Re-Render (PC path) ───────────────────
+# Text shaping (OpenType GSUB/GPOS, Devanagari conjuncts, Arabic ligatures)
+uharfbuzz>=0.55.0
+# Glyph rasterization from shaped glyph sequences
+freetype-py>=2.5.0
+# BiDi visual reorder for RTL scripts (Arabic, Hebrew, Urdu)
+python-bidi>=0.4.2
+# ONNX Runtime (for optional neural font classifier — lazy-loaded)
+onnxruntime>=1.18.0
+
