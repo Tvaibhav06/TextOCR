@@ -34,3 +34,4 @@ debug.keystore
 .cxx/
 .idea/
 *.log
+test_img.jpg

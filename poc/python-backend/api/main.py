@@ -392,7 +392,7 @@ async def process_translate_image(
                         })
                     else:
                         valid_ocr.append({
-                            "has_text": True,
+                            "has_text": False,
                             "obj": OcrResult(
                                 det_id=r_id, text="", confidence=conf,
                                 skip=True, x=x, y=y, w=w, h=h
@@ -413,8 +413,12 @@ async def process_translate_image(
         if injected_detections is not None:
             # ── Stage 1-4 Bypass ──
             h_img, w_img = img_bgr.shape[:2]
-            mask = pipe.masker.generate(injected_detections, h_img, w_img, dilation_px=5)
-            inpainted, _ = pipe.inpainter.inpaint(img_bgr, mask, radius=7, method='telea')
+            
+            # Adaptive dilation for tight MLKit boxes
+            dilation_px = max(12, int(min(h_img, w_img) * 0.015))
+            
+            mask = pipe.masker.generate(injected_detections, h_img, w_img, dilation_px=dilation_px)
+            inpainted, _ = pipe.inpainter.inpaint(img_bgr, mask, radius=7)
             
             result = PipelineResult(
                 output=inpainted, mask=mask, detections=injected_detections,
@@ -431,6 +435,7 @@ async def process_translate_image(
         else:
             # ── Stage 5: OCR text from original image
             if injected_ocr_results is not None:
+                from pipeline.translation import TranslationRouter
                 ocr_engine = get_ocr()
                 ocr_results = []
                 for i, det in enumerate(result.detections):
@@ -438,7 +443,13 @@ async def process_translate_image(
                     if inj["has_text"]:
                         ocr_results.append(inj["obj"])
                     else:
-                        partial_res = ocr_engine.run(img_bgr, [det])
+                        # Attempt to derive source script from mobile text (if any), else 'und'
+                        hint = "und"
+                        inj_text = inj["obj"].text.strip()
+                        if inj_text:
+                            hint = TranslationRouter._identify_language(inj_text)
+                            
+                        partial_res = ocr_engine.run(img_bgr, [det], source_lang_hint=hint)
                         if partial_res:
                             ocr_results.append(partial_res[0])
             else:
@@ -455,7 +466,7 @@ async def process_translate_image(
                         text=r.text, engine="skipped", src_lang="auto", tgt_lang=target_lang
                     ))
                 else:
-                    res = translator.translate(r.text, src="en", tgt=target_lang)
+                    res = translator.translate(r.text, src="auto", tgt=target_lang)
                     tr_results.append(res)
             
             # ── Stage 7: Render translated text onto inpainted image
@@ -468,10 +479,12 @@ async def process_translate_image(
                 target_lang=target_lang
             )
             
-            import json, urllib.parse
-            translated_strings = [tr.text for tr in tr_results if tr and tr.engine != "failed" and tr.text]
-            encoded_texts = urllib.parse.quote(json.dumps(translated_strings))
-            
+            import json
+            translated_strings = [
+                tr.text
+                for tr in tr_results
+                if tr and tr.engine not in ("failed",) and tr.text and tr.text.strip()
+            ]
             translated_count = len(translated_strings)
 
         elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
@@ -481,8 +494,8 @@ async def process_translate_image(
         raise HTTPException(status_code=500, detail=f"Pipeline failed: {exc}") from exc
 
     _translated_count = translated_count if 'translated_count' in locals() else 0
-    _encoded_texts    = encoded_texts    if 'encoded_texts'    in locals() else []
-    _detections       = len(result.detections) if 'result' in locals() else 0
+    _translated_strings = translated_strings if 'translated_strings' in locals() else []
+    _detections         = len(result.detections) if 'result' in locals() else 0
 
     log.info(
         "Translate done: %d regions translated in %.1fms",
@@ -499,7 +512,7 @@ async def process_translate_image(
 
     return JSONResponse({
         "image_b64":        image_b64,
-        "translated_texts": _encoded_texts if isinstance(_encoded_texts, list) else [],
+        "translated_texts": _translated_strings,
         "total_ms":         elapsed_ms,
         "detections":       _detections,
         "translations":     _translated_count,

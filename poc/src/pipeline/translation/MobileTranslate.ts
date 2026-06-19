@@ -255,9 +255,11 @@ class MobileTranslator {
       }
     };
 
-    // Ensure models downloaded before starting translations
-    await ensureModelDownloaded(src, progressOnce);
+    // Only pre-download target model. Source model is downloaded lazily if src="auto"
     await ensureModelDownloaded(tgt, progressOnce);
+    if (src !== 'auto') {
+      await ensureModelDownloaded(src, progressOnce);
+    }
 
     // Translate regions sequentially (ML Kit is single-threaded on device)
     return Promise.all(
@@ -266,7 +268,33 @@ class MobileTranslator {
           // Pass through skipped regions — Stage 7 won't render them
           return { text: ocr.text, engine: 'mlkit', srcLang: src, tgtLang: tgt };
         }
-        return this.translate(ocr.text, src, tgt);
+
+        let detectedSrc = src;
+        if (src === 'auto') {
+          // 1. ML Kit detector
+          detectedSrc = await this.identifyLanguage(ocr.text);
+
+          // 2. Fallback if uncertain
+          if (detectedSrc === 'und') {
+            detectedSrc = this.identifyScriptHint(ocr.text);
+          }
+
+          // 3. Last resort fallback for short pure Latin
+          if (detectedSrc === 'und' && /^[a-zA-Z\s]+$/.test(ocr.text.trim()) && ocr.text.trim().length > 0) {
+            detectedSrc = 'en';
+          }
+
+          if (detectedSrc !== 'und') {
+            await ensureModelDownloaded(detectedSrc, progressOnce);
+          }
+        }
+
+        // If it's completely undetermined, pass it through
+        if (detectedSrc === 'und') {
+          return { text: ocr.text, engine: 'mlkit', srcLang: 'und', tgtLang: tgt };
+        }
+
+        return this.translate(ocr.text, detectedSrc, tgt);
       }),
     );
   }
@@ -282,6 +310,21 @@ class MobileTranslator {
     } catch {
       return 'und';
     }
+  }
+
+  /**
+   * Fallback: Identify language based on Unicode block hints.
+   * Returns BCP-47 code or 'und' if unknown.
+   */
+  identifyScriptHint(text: string): string {
+    if (/[\u0900-\u097F]/.test(text)) return 'hi'; // Devanagari (Hindi)
+    if (/[\u0980-\u09FF]/.test(text)) return 'bn'; // Bengali
+    if (/[\u0B80-\u0BFF]/.test(text)) return 'ta'; // Tamil
+    if (/[\u0C00-\u0C7F]/.test(text)) return 'te'; // Telugu
+    if (/[\u0600-\u06FF]/.test(text)) return 'ur'; // Arabic/Urdu
+    if (/[\u4E00-\u9FFF]/.test(text)) return 'zh'; // Chinese/Kanji
+    if (/[\u0400-\u04FF]/.test(text)) return 'ru'; // Cyrillic
+    return 'und';
   }
 
   /**

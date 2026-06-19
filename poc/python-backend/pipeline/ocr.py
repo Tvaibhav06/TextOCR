@@ -34,8 +34,8 @@ import numpy as np
 log = logging.getLogger("textremover.ocr")
 
 # ── Confidence gate constants ─────────────────────────────────────────────────
-MIN_CONFIDENCE: float = 0.60   # Regions below this are skipped
-MIN_TEXT_LEN:   int   = 3      # Single characters / noise are skipped
+MIN_CONFIDENCE: float = 0.40   # Regions below this are skipped (noise threshold)
+MIN_TEXT_LEN:   int   = 2      # Single-char noise skipped; 2+ chars are kept
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ def _crop_deskew(img: np.ndarray, polygon: np.ndarray,
                  padding: int = 2) -> Optional[np.ndarray]:
     """
     Crop a quadrilateral polygon region from an image and de-skew it to
-    a horizontal rectangle.
+    a horizontal rectangle using a perspective transform.
 
     Args:
         img:     Full BGR image (the ORIGINAL, pre-inpainting frame).
@@ -71,44 +71,48 @@ def _crop_deskew(img: np.ndarray, polygon: np.ndarray,
     """
     pts = polygon.astype(np.float32)
 
+    # core.py stores polygons as (N, 1, 2) for cv2.fillPoly — squeeze to (N, 2)
+    if pts.ndim == 3 and pts.shape[1] == 1:
+        pts = pts.reshape(-1, 2)
+
     if pts.ndim != 2 or pts.shape[0] < 3:
         log.debug("_crop_deskew: degenerate polygon shape %s", pts.shape)
         return None
 
-    # Compute rotation angle from the first edge of the polygon
-    angle_rad = math.atan2(
-        float(pts[1][1] - pts[0][1]),
-        float(pts[1][0] - pts[0][0])
-    )
-    angle_deg = math.degrees(angle_rad)
+    # Ensure it's exactly 4 points for perspective transform
+    if pts.shape[0] != 4:
+        x, y, w, h = cv2.boundingRect(pts)
+        pts = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
 
-    # Bounding rect of the polygon (clipped to image bounds)
-    h_img, w_img = img.shape[:2]
-    x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+    # Compute target dimensions
+    w1 = np.linalg.norm(pts[0] - pts[1])
+    w2 = np.linalg.norm(pts[2] - pts[3])
+    target_w = int(max(w1, w2))
 
-    # Degenerate polygon: too small to hold text (cv2 returns 1x1 for all-same-point)
-    if w * h < 4:
-        log.debug("_crop_deskew: near-zero-area polygon (w=%d, h=%d)", w, h)
+    h1 = np.linalg.norm(pts[0] - pts[3])
+    h2 = np.linalg.norm(pts[1] - pts[2])
+    target_h = int(max(h1, h2))
+
+    if target_w < 4 or target_h < 4:
+        log.debug("_crop_deskew: near-zero-area polygon (w=%d, h=%d)", target_w, target_h)
         return None
 
-    x1 = max(0, x - padding)
-    y1 = max(0, y - padding)
-    x2 = min(w_img, x + w + padding)
-    y2 = min(h_img, y + h + padding)
+    # Apply padding to target dimensions
+    target_w += padding * 2
+    target_h += padding * 2
 
-    if x2 <= x1 or y2 <= y1:
-        log.debug("_crop_deskew: degenerate bbox [%d,%d,%d,%d]", x1, y1, x2, y2)
-        return None
+    # Destination points with padding offset
+    dst_pts = np.array([
+        [padding, padding],
+        [target_w - 1 - padding, padding],
+        [target_w - 1 - padding, target_h - 1 - padding],
+        [padding, target_h - 1 - padding]
+    ], dtype=np.float32)
 
-    crop = img[y1:y2, x1:x2].copy()
-
-    # Only de-skew if the angle is non-trivial (>1°)
-    if abs(angle_deg) > 1.0:
-        cx, cy = crop.shape[1] / 2, crop.shape[0] / 2
-        M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
-        crop = cv2.warpAffine(crop, M, (crop.shape[1], crop.shape[0]),
-                              flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_REPLICATE)
+    M = cv2.getPerspectiveTransform(pts, dst_pts)
+    crop = cv2.warpPerspective(img, M, (target_w, target_h),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
 
     return crop
 
@@ -127,35 +131,36 @@ class RegionOCR:
     """
 
     def __init__(self) -> None:
-        self._rec = None   # lazy-loaded on first use
+        self._recs: dict[str, object] = {}   # lazy-loaded on first use per lang
 
-    def _ensure_loaded(self) -> None:
-        if self._rec is not None:
+    def _ensure_loaded(self, paddle_lang: str) -> None:
+        if paddle_lang in self._recs:
             return
-        log.info("[Stage 5] Loading PaddleOCR recognizer (rec=True, det=False) …")
+        log.info("[Stage 5] Loading PaddleOCR recognizer (lang=%s, rec=True, det=False) …", paddle_lang)
         try:
             # Disable PIR / OneDNN to match the same flags as Stage 1
             import paddle
             paddle.set_flags({"FLAGS_enable_pir_api": False})
             from paddleocr import PaddleOCR
-            self._rec = PaddleOCR(
-                lang="en",
+            self._recs[paddle_lang] = PaddleOCR(
+                lang=paddle_lang,
                 det=False,        # Detection already done in Stage 1
                 rec=True,
                 cls=True,
                 use_angle_cls=True,
                 show_log=False,
             )
-            log.info("[Stage 5] PaddleOCR recognizer loaded.")
+            log.info("[Stage 5] PaddleOCR recognizer (%s) loaded.", paddle_lang)
         except Exception as exc:
-            log.error("[Stage 5] Failed to load PaddleOCR: %s", exc)
+            log.error("[Stage 5] Failed to load PaddleOCR (%s): %s", paddle_lang, exc)
             raise RuntimeError(f"Stage 5 OCR init failed: {exc}") from exc
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run(self,
             original_bgr: np.ndarray,
-            detections: list) -> List[OcrResult]:
+            detections: list,
+            source_lang_hint: str = "und") -> List[OcrResult]:
         """
         Run recognition on each detected region from the ORIGINAL image.
 
@@ -165,18 +170,36 @@ class RegionOCR:
             detections:   List of Detection objects from Stage 1.
                           Expected attributes: .id, .polygon (np.ndarray N×2),
                           .bbox (.x .y .w .h).
+            source_lang_hint: ISO language code hint for the source text.
 
         Returns:
             List of OcrResult, one per detection, in the same order.
         """
-        self._ensure_loaded()
+        # Map hint to paddle language
+        # PaddleOCR supported: ch, en, french, german, korean, japan, arabic, devanagari, ta, te, ka...
+        hint_map = {
+            "hi": "devanagari", "mr": "devanagari", "ne": "devanagari", "sa": "devanagari",
+            "ur": "arabic", "ar": "arabic", "fa": "arabic",
+            "ta": "ta", "te": "te", "kn": "ka",
+            "pa": "en", # Fallback to en/latin as paddleocr v4 default doesn't explicitly bundle pa
+            "en": "en",
+        }
+        
+        if source_lang_hint == "und":
+            paddle_lang = "ch" # Default multilingual model (English + Chinese) if completely unknown
+        elif source_lang_hint in hint_map:
+            paddle_lang = hint_map[source_lang_hint]
+        else:
+            paddle_lang = "en" # Fallback to english for pure latin/unknown
+            
+        self._ensure_loaded(paddle_lang)
         results: List[OcrResult] = []
 
         for det in detections:
             polygon = np.array(det.polygon, dtype=np.float32)
             crop = _crop_deskew(original_bgr, polygon)
 
-            text, conf = self._recognize_crop(crop, det.id)
+            text, conf = self._recognize_crop(crop, det.id, paddle_lang)
             skip = (conf < MIN_CONFIDENCE or len(text.strip()) < MIN_TEXT_LEN)
 
             results.append(OcrResult(
@@ -213,7 +236,8 @@ class RegionOCR:
 
     def _recognize_crop(self,
                         crop: Optional[np.ndarray],
-                        det_id: int) -> Tuple[str, float]:
+                        det_id: int,
+                        paddle_lang: str) -> Tuple[str, float]:
         """Run PaddleOCR rec on a single cropped image. Returns (text, conf)."""
         if crop is None or crop.size == 0:
             log.debug("[Stage 5] Region %d: empty crop.", det_id)
@@ -226,7 +250,7 @@ class RegionOCR:
             return "", 0.0
 
         try:
-            result = self._rec.ocr(crop, det=False, cls=True)
+            result = self._recs[paddle_lang].ocr(crop, det=False, cls=True)
             # PaddleOCR rec-only format (det=False):
             #   result = [ [text, score], [text, score], ... ]
             #   result[0] = [text, score]

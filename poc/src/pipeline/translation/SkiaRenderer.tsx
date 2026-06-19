@@ -37,6 +37,7 @@ import {
   useFonts,
   useImage,
   Group,
+  ColorType,
 } from '@shopify/react-native-skia';
 import type { MobileOcrResult } from './MobileOCR';
 import type { MobileTranslationResult } from './MobileTranslate';
@@ -94,7 +95,8 @@ const CAP_RATIOS: Record<string, number> = {
 
 function estimateFontSize(bboxH: number, lang: string): number {
   const ratio = CAP_RATIOS[lang.toLowerCase()] ?? 0.72;
-  return Math.max(8, Math.floor(bboxH * ratio));
+  // Font size = Cap Height / Ratio. bboxH serves as the max available cap height.
+  return Math.max(8, Math.floor(bboxH / ratio));
 }
 
 // ── Font mapping — (FontClass, weight, lang) → bundled Noto asset name ───────
@@ -115,6 +117,7 @@ function getFontAssetName(fontClass: FontClass, weight: FontWeight, lang: string
 
   // ── Script-specific fonts (ignore fontClass — script determines font) ─────
   if (['hi','mr','ne','sa','mai','doi','kok','brx'].includes(lc)) {
+    if (fontClass === 'SERIF') return 'NotoSerifDevanagari-Regular';
     return bold ? 'NotoSansDevanagari-Bold' : 'NotoSansDevanagari-Regular';
   }
   if (['bn','as','mni'].includes(lc))  return 'NotoSansBengali-Regular';   // no bold bundled
@@ -358,37 +361,57 @@ function kMeans2(pixels: Uint8Array, stride: number): [number, number, number] {
     if (n1 > 0) c1 = [s1[0]/n1, s1[1]/n1, s1[2]/n1];
   }
 
-  // Darker centroid = text color (lower luminance)
-  const lum0 = 0.299*c0[0] + 0.587*c0[1] + 0.114*c0[2];
-  const lum1 = 0.299*c1[0] + 0.587*c1[1] + 0.114*c1[2];
-  const text  = lum0 < lum1 ? c0 : c1;
+  // The minority cluster (fewer pixels) is typically the text color,
+  // since text surface area is smaller than the background surface area.
+  // This works universally for light-on-dark AND dark-on-light text!
+  let n0_final = 0; let n1_final = 0;
+  for (let i = 0; i < n; i++) {
+    const r = pixels[i * stride], g = pixels[i * stride + 1], b = pixels[i * stride + 2];
+    const d0 = (r-c0[0])**2 + (g-c0[1])**2 + (b-c0[2])**2;
+    const d1 = (r-c1[0])**2 + (g-c1[1])**2 + (b-c1[2])**2;
+    if (d0 < d1) n0_final++; else n1_final++;
+  }
+  const text = n0_final < n1_final ? c0 : c1;
   return [Math.round(text[0]), Math.round(text[1]), Math.round(text[2])];
 }
 
 function borderMedian(pixels: Uint8Array, width: number, height: number, border = 4): [number,number,number] {
+  if (!pixels || width <= 0 || height <= 0) return [255, 255, 255];
+  
   const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+  const safeBorder = Math.max(1, Math.min(border, Math.floor(width / 2), Math.floor(height / 2)));
+  
   for (let x = 0; x < width; x++) {
-    for (let b = 0; b < border; b++) {
+    for (let b = 0; b < safeBorder; b++) {
       const top    = (b * width + x) * 4;
       const bottom = ((height - 1 - b) * width + x) * 4;
-      rs.push(pixels[top], pixels[bottom]);
-      gs.push(pixels[top+1], pixels[bottom+1]);
-      bs.push(pixels[top+2], pixels[bottom+2]);
+      if (top >= 0 && top < pixels.length && bottom >= 0 && bottom < pixels.length) {
+        rs.push(pixels[top], pixels[bottom]);
+        gs.push(pixels[top+1], pixels[bottom+1]);
+        bs.push(pixels[top+2], pixels[bottom+2]);
+      }
     }
   }
-  for (let y = border; y < height - border; y++) {
-    for (let b = 0; b < border; b++) {
+  for (let y = safeBorder; y < height - safeBorder; y++) {
+    for (let b = 0; b < safeBorder; b++) {
       const left  = (y * width + b) * 4;
       const right = (y * width + (width - 1 - b)) * 4;
-      rs.push(pixels[left], pixels[right]);
-      gs.push(pixels[left+1], pixels[right+1]);
-      bs.push(pixels[left+2], pixels[right+2]);
+      if (left >= 0 && left < pixels.length && right >= 0 && right < pixels.length) {
+        rs.push(pixels[left], pixels[right]);
+        gs.push(pixels[left+1], pixels[right+1]);
+        bs.push(pixels[left+2], pixels[right+2]);
+      }
     }
   }
-  const med = (arr: number[]) => { arr.sort((a,b)=>a-b); return arr[Math.floor(arr.length/2)]; };
+  
+  if (rs.length === 0) return [255, 255, 255];
+  
+  const med = (arr: number[]) => { 
+    arr.sort((a,b)=>a-b); 
+    return arr[Math.floor(arr.length/2)] ?? 255; 
+  };
   return [med(rs), med(gs), med(bs)];
 }
-
 // ── Per-region style attributes (computed once per render) ────────────────────
 
 interface RegionStyle {
@@ -411,36 +434,64 @@ const DEFAULT_STYLE: RegionStyle = {
 
 function buildParagraph(
   text:       string,
-  fontSize:   number,
+  baseFontSize: number,
   textColor:  ReturnType<typeof Skia.Color>,
   fontName:   string,
   maxWidth:   number,
+  maxHeight:  number,
   rtl:        boolean,
   weight:     FontWeight,
+  fontMgr:    any
 ) {
-  const paraStyle = {
-    textAlign:     rtl ? TextAlign.Right : TextAlign.Left,
-    textDirection: rtl ? 1 : 0,
-    maxLines:      4,
-    ellipsis:      '…',
-  };
+  let fontSize = baseFontSize;
+  let para: ReturnType<typeof Skia.ParagraphBuilder.Make> | any = null;
 
-  const builder = Skia.ParagraphBuilder.Make(paraStyle);
-  builder.pushStyle({
-    color:        textColor,
-    fontSize:     fontSize,
-    fontFamilies: [fontName, 'NotoSans-Regular'],
-    fontStyle:    {
-      weight: weight === 'BOLD' ? 700 : 400,
-      width:  5,
-      slant:  FontSlant.Upright,
-    },
-  });
-  builder.addText(text);
-  builder.pop();
+  for (let i = 0; i < 5; i++) {
+    const paraStyle = {
+      textAlign:     TextAlign.Center,
+      textDirection: rtl ? 1 : 0,
+      maxLines:      4,
+      ellipsis:      '…',
+    };
 
-  const para = builder.build();
-  para.layout(maxWidth);
+    const builder = Skia.ParagraphBuilder.Make(paraStyle, fontMgr);
+    builder.pushStyle({
+      color:        textColor,
+      fontSize:     fontSize,
+      fontFamilies: [fontName, 'NotoSans-Regular'],
+      fontStyle:    {
+        weight: weight === 'BOLD' ? 700 : 400,
+        width:  5,
+        slant:  FontSlant.Upright,
+      },
+    });
+    builder.addText(text);
+    builder.pop();
+
+    para = builder.build();
+    para.layout(maxWidth);
+
+    const metrics = para.getLineMetrics ? para.getLineMetrics() : [];
+    const lineCount = metrics.length > 0 ? metrics.length : 1;
+    const longestLine = para.getLongestLine ? para.getLongestLine() : 0;
+    
+    const fitsHorizontally = longestLine <= maxWidth;
+    const fitsVertically = para.getHeight() <= maxHeight;
+
+    if (lineCount === 1) {
+      // Single line text: Trust the mathematically perfect cap-height font size.
+      // Ignore para.getHeight() because typographic ascenders/descenders artificially inflate it.
+      if (fitsHorizontally) break;
+    } else {
+      // Multi-line text: Must fit entirely within the original bounding box height and width.
+      if (fitsHorizontally && fitsVertically) break;
+    }
+
+    if (fontSize <= 8) {
+      break;
+    }
+    fontSize = Math.floor(fontSize * 0.85);
+  }
   return para;
 }
 
@@ -507,6 +558,7 @@ export function TranslatedOverlay({
     'NotoSansMono-Bold':             [require('../../../assets/fonts/NotoSansMono-Bold.ttf')],
     'NotoSansDevanagari-Regular':    [require('../../../assets/fonts/NotoSansDevanagari-Regular.ttf')],
     'NotoSansDevanagari-Bold':       [require('../../../assets/fonts/NotoSansDevanagari-Bold.ttf')],
+    'NotoSerifDevanagari-Regular':   [require('../../../assets/fonts/NotoSerifDevanagari-Regular.ttf')],
     'NotoSansBengali-Regular':       [require('../../../assets/fonts/NotoSansBengali-Regular.ttf')],
     'NotoSansTamil-Regular':         [require('../../../assets/fonts/NotoSansTamil-Regular.ttf')],
     'NotoSansTelugu-Regular':        [require('../../../assets/fonts/NotoSansTelugu-Regular.ttf')],
@@ -531,8 +583,14 @@ export function TranslatedOverlay({
     // Extract pixels for both images from Skia
     const origInfo    = originalImage.getImageInfo();
     const inpInfo     = inpaintedImage.getImageInfo();
+    
     const origPixels  = originalImage.readPixels(0, 0, origInfo);
     const inpPixels   = inpaintedImage.readPixels(0, 0, inpInfo);
+
+    // We check the native color format so we can normalize BGRA to RGBA.
+    // (We do not pass a custom ImageInfo to readPixels because origInfo might be a HostObject that fails to spread).
+    const isOrigNativeBgra = origInfo.colorType === 6; // 6 = BGRA_8888
+    const isInpNativeBgra  = inpInfo.colorType === 6;
 
     const styles: RegionStyle[] = ocrResults.map((ocr) => {
       try {
@@ -555,21 +613,58 @@ export function TranslatedOverlay({
         const origCrop   = new Uint8Array(cw * ch * 4);
         for (let row = 0; row < ch; row++) {
           const srcOff = (y0 + row) * origStride + x0 * 4;
+          const dstOff = row * cw * 4;
           origCrop.set(
             (origPixels as Uint8Array).subarray(srcOff, srcOff + cw * 4),
-            row * cw * 4,
+            dstOff,
           );
+          // Explicit channel normalization if Skia failed to fulfill RGBA request
+          if (isOrigNativeBgra) {
+            for (let i = 0; i < cw; i++) {
+              const p = dstOff + i * 4;
+              const b = origCrop[p];
+              origCrop[p] = origCrop[p + 2];
+              origCrop[p + 2] = b;
+            }
+          }
         }
 
-        // Crop inpainted region for bg color
-        const inpStride = inpInfo.width * 4;
-        const inpCrop   = new Uint8Array(cw * ch * 4);
-        for (let row = 0; row < ch; row++) {
-          const srcOff = (y0 + row) * inpStride + x0 * 4;
-          inpCrop.set(
-            (inpPixels as Uint8Array).subarray(srcOff, srcOff + cw * 4),
-            row * cw * 4,
-          );
+        // ── Crop inpainted region for bg color ──
+        // Scale coordinates carefully since the backend might have downscaled inpaintedImage!
+        const scaleX = inpInfo.width / origInfo.width;
+        const scaleY = inpInfo.height / origInfo.height;
+
+        const ix0 = Math.max(0, Math.floor(x * scaleX));
+        const iy0 = Math.max(0, Math.floor(y * scaleY));
+        const ix1 = Math.min(inpInfo.width, Math.ceil((x + bw) * scaleX));
+        const iy1 = Math.min(inpInfo.height, Math.ceil((y + bh) * scaleY));
+        const icw = Math.max(0, ix1 - ix0);
+        const ich = Math.max(0, iy1 - iy0);
+
+        let inpCrop: Uint8Array;
+        if (icw < 2 || ich < 2) {
+          // Fallback to a fake 2x2 crop if scaled box is too tiny
+          inpCrop = new Uint8Array(2 * 2 * 4).fill(255);
+        } else {
+          const inpStride = inpInfo.width * 4;
+          inpCrop = new Uint8Array(icw * ich * 4);
+          for (let row = 0; row < ich; row++) {
+            const srcOff = (iy0 + row) * inpStride + ix0 * 4;
+            const dstOff = row * icw * 4;
+            inpCrop.set(
+              (inpPixels as Uint8Array).subarray(srcOff, srcOff + icw * 4),
+              dstOff,
+            );
+            // Explicit channel normalization
+            if (isInpNativeBgra) {
+              for (let i = 0; i < icw; i++) {
+                const p = dstOff + i * 4;
+                const b = inpCrop[p];
+                inpCrop[p] = inpCrop[p + 2];
+                inpCrop[p + 2] = b;
+              }
+            }
+          }
         }
 
         // Font classification (skip for very small regions)
@@ -587,7 +682,7 @@ export function TranslatedOverlay({
         const textColor = Skia.Color(`rgb(${tr},${tg},${tb})`);
 
         // Background color from inpainted border
-        const [br, bg, bb] = borderMedian(inpCrop, cw, ch);
+        const [br, bg, bb] = borderMedian(inpCrop, icw, ich);
         const bgColor  = Skia.Color(`rgba(${br},${bg},${bb},0.85)`);
 
         // Contrast ratio check (simplified WCAG luminance)
@@ -641,8 +736,10 @@ export function TranslatedOverlay({
           style.textColor,
           fontName,
           ocr.bbox.width,
+          ocr.bbox.height,
           rtl,
           style.weight,
+          customFonts
         );
         return { ocr, para, style, ok: true };
       } catch (e) {
@@ -732,11 +829,11 @@ export function TranslatedOverlay({
                     />
                   )}
 
-                  {/* Translated text paragraph */}
+                  {/* Translated text paragraph (Vertically centered) */}
                   <Paragraph
                     paragraph={para!}
                     x={ocr.bbox.x}
-                    y={ocr.bbox.y}
+                    y={ocr.bbox.y + Math.max(0, (ocr.bbox.height - para!.getHeight()) / 2)}
                     width={ocr.bbox.width}
                   />
                 </Group>

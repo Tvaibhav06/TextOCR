@@ -435,7 +435,11 @@ class BackendService {
             polygon: poly,
             text: ocr ? ocr.text : "",
             confidence: ocr ? ocr.confidence : det.confidence,
-            skip: ocr ? ocr.skip : true
+            // Never mark skip=true when we have OCR text from mobile.
+            // The mobile skip flag means on-device confidence was low, but
+            // the text string is still valid — the server should translate it.
+            // Only mark skip=true when there is genuinely no text at all.
+            skip: ocr && ocr.text && ocr.text.trim() ? false : true,
           });
         }
         const payload = { version: 1, regions };

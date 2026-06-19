@@ -53,3 +53,6 @@ python-bidi>=0.4.2
 # ONNX Runtime (for optional neural font classifier — lazy-loaded)
 onnxruntime>=1.18.0
 
+# ── Phase 3 / Stage 6: Dynamic Language Detection ──────────────────────────────
+# Pure Python language detection for src="auto" support
+langdetect>=1.0.9

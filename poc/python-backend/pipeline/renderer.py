@@ -282,8 +282,10 @@ class FontAttributeExtractor:
         """
         attrs = FontAttrs()
         attrs.is_rtl  = target_lang.lower() in RTL_LANGS
-        attrs.size_px = max(8, int(bbox_h * _CAP_RATIOS.get(
-                            target_lang.lower(), _CAP_RATIOS["default"])))
+        # Use bbox_h as the initial font size so glyphs fill the full region
+        # height. _rasterize_glyphs() will scale down adaptively if the text
+        # is wider than the bounding box width.
+        attrs.size_px = max(8, bbox_h)
 
         # ── Font class ────────────────────────────────────────────────────────
         try:
@@ -317,9 +319,15 @@ class FontAttributeExtractor:
             log.debug("Text color extraction failed: %s", exc)
 
         try:
-            attrs.bg_color = self._border_median(inpainted_crop)
+            # Sample background pixels directly using the binarized text mask.
+            # This gives the actual background colour (e.g. the green of a sign)
+            # rather than an edge-strip approximation.
+            attrs.bg_color = self._bg_color_from_mask(original_crop)
         except Exception as exc:
-            log.debug("BG color extraction failed: %s", exc)
+            try:
+                attrs.bg_color = self._border_median(original_crop)
+            except Exception:
+                log.debug("BG color extraction failed: %s", exc)
 
         return attrs
 
@@ -385,26 +393,86 @@ class FontAttributeExtractor:
 
     def _dominant_color(self, crop: np.ndarray) -> Tuple[int, int, int]:
         """
-        K-Means (k=2) on the crop pixels. Returns the darker cluster centroid
-        as the text (foreground) colour in BGR.
+        Extract text (foreground) colour by:
+          1. Otsu binarization → foreground mask.
+          2. Direct mean of all foreground pixels in BGR.
+
+        This is more reliable than K-Means for sign/document images where
+        text pixels are a small minority with a uniform hue (e.g. white on green).
+        Falls back to K-Means minority cluster if the foreground mask is too small.
         """
-        if crop.size == 0:
-            return (0, 0, 0)
+        if crop is None or crop.size == 0:
+            return (255, 255, 255)
+
+        # Ensure BGR (3-channel)
+        if crop.ndim == 2:
+            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        if crop.shape[2] == 4:
+            crop = crop[:, :, :3]
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # ── Otsu binarization ─────────────────────────────────────────────────
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Decide if text is light-on-dark or dark-on-light:
+        # if the inverted mask has fewer pixels, text is the minority → it was
+        # inverted by THRESH_BINARY_INV (dark-on-light), flip back.
+        fg_count_inv = int(np.count_nonzero(binary))
+        total = binary.size
+        if fg_count_inv > total * 0.5:
+            # Most pixels are "foreground" → wrong polarity; flip
+            binary = cv2.bitwise_not(binary)
+
+        fg_count = int(np.count_nonzero(binary))
+
+        # ── Sample foreground pixels directly ─────────────────────────────────
+        if fg_count >= 20:
+            fg_pixels = crop[binary > 0].astype(np.float32)
+            mean_color = fg_pixels.mean(axis=0)  # BGR mean
+            return tuple(int(v) for v in mean_color)
+
+        # ── Fallback: K-Means minority cluster ────────────────────────────────
         pixels = crop.reshape(-1, 3).astype(np.float32)
         if len(pixels) < 2:
-            return tuple(int(v) for v in pixels[0])
+            return (255, 255, 255)
         _, labels, centers = cv2.kmeans(
-            pixels, 2,
-            None,
+            pixels, 2, None,
             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
-            3,
-            cv2.KMEANS_RANDOM_CENTERS,
+            3, cv2.KMEANS_RANDOM_CENTERS,
         )
-        # Darker centroid = text colour (lower sum)
-        c0_brightness = float(centers[0].sum())
-        c1_brightness = float(centers[1].sum())
-        text_center = centers[0] if c0_brightness < c1_brightness else centers[1]
+        n0 = int(np.sum(labels == 0))
+        n1 = int(np.sum(labels == 1))
+        text_center = centers[0] if n0 <= n1 else centers[1]
         return tuple(int(v) for v in text_center)
+
+    def _bg_color_from_mask(self, crop: np.ndarray) -> Tuple[int, int, int]:
+        """
+        Extract background colour by sampling background (non-text) pixels directly
+        using Otsu binarization to identify them.
+        """
+        if crop is None or crop.size == 0:
+            return (255, 255, 255)
+        if crop.ndim == 2:
+            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        if crop.shape[2] == 4:
+            crop = crop[:, :, :3]
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        fg_count = int(np.count_nonzero(binary))
+        if fg_count > binary.size * 0.5:
+            binary = cv2.bitwise_not(binary)
+
+        # Background = everything that is NOT the text foreground
+        bg_mask = cv2.bitwise_not(binary)
+        bg_count = int(np.count_nonzero(bg_mask))
+        if bg_count >= 20:
+            bg_pixels = crop[bg_mask > 0].astype(np.float32)
+            mean_color = bg_pixels.mean(axis=0)
+            return tuple(int(v) for v in mean_color)
+
+        return self._border_median(crop)
 
     def _border_median(self, crop: np.ndarray,
                         border_px: int = 5) -> Tuple[int, int, int]:
@@ -620,14 +688,27 @@ class TextRenderer:
         log.info("[Stage 7] Rendering %d regions for lang=%s", len(paired), target_lang)
 
         for ocr, tr in paired:
-            # Honour skip flags from previous stages
+            # Hard skip: region was explicitly flagged as no-text by OCR
             if ocr.skip:
                 log.debug("[Stage 7] Region %d: OCR skip — left erased", ocr.det_id)
                 continue
+
+            # Choose render text:
+            #   • Translated text when translation succeeded
+            #   • Original OCR text as graceful fallback when translation failed
+            #     (gives useful output rather than a blank inpainted region)
             if tr.engine == "failed":
-                log.debug("[Stage 7] Region %d: translation failed — left erased", ocr.det_id)
-                continue
-            if not tr.text or not tr.text.strip():
+                fallback_text = (ocr.text or "").strip()
+                if not fallback_text:
+                    log.debug("[Stage 7] Region %d: translation failed, no OCR text — left erased", ocr.det_id)
+                    continue
+                log.info("[Stage 7] Region %d: translation failed — rendering original text %r",
+                         ocr.det_id, fallback_text[:40])
+                render_text = fallback_text
+            else:
+                render_text = (tr.text or "").strip()
+
+            if not render_text:
                 continue
 
             # Clamp bbox to image bounds
@@ -646,7 +727,7 @@ class TextRenderer:
                     target_lang=target_lang,
                 )
                 output = self._render_region(
-                    output, tr.text, attrs,
+                    output, render_text, attrs,
                     target_lang=target_lang,
                     bbox=(x, y, x2 - x, y2 - y),
                 )
@@ -656,6 +737,55 @@ class TextRenderer:
 
         log.info("[Stage 7] Rendering complete.")
         return output
+
+    # ── Utility: Color Math ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _srgb_to_linear(img: np.ndarray) -> np.ndarray:
+        """Convert sRGB to linear light."""
+        img_f = img.astype(np.float32) / 255.0
+        return np.where(img_f <= 0.04045, img_f / 12.92, ((img_f + 0.055) / 1.055) ** 2.4)
+
+    @staticmethod
+    def _linear_to_srgb(img: np.ndarray) -> np.ndarray:
+        """Convert linear light to sRGB."""
+        img_clip = np.clip(img, 0.0, 1.0)
+        return np.where(img_clip <= 0.0031308, img_clip * 12.92, 1.055 * np.power(img_clip, 1.0 / 2.4) - 0.055) * 255.0
+
+    # ── Text Wrapping ─────────────────────────────────────────────────────────
+
+    def _wrap_text(self, text: str, font_path: Path, size_px: int, max_width: int, is_cjk: bool) -> List[str]:
+        """Wrap text into multiple lines ensuring no line exceeds max_width."""
+        if is_cjk:
+            tokens = list(text)
+        else:
+            words = text.split(' ')
+            tokens = [w + ' ' for w in words[:-1]] + [words[-1]] if words else []
+
+        lines = []
+        current_line = ""
+        current_w = 0
+
+        for token in tokens:
+            try:
+                # Shape token to measure advance
+                _, pos = self._shape_text(token, font_path, size_px)
+                token_w = sum(p.x_advance for p in pos) >> 6
+            except Exception:
+                token_w = len(token) * (size_px // 2)
+
+            if current_w + token_w > max_width and current_line:
+                lines.append(current_line.rstrip())
+                current_line = token
+                current_w = token_w
+            else:
+                current_line += token
+                current_w += token_w
+
+        if current_line:
+            lines.append(current_line.rstrip())
+            
+        return lines or [""]
 
     # ── Per-region rendering ──────────────────────────────────────────────────
 
@@ -675,63 +805,125 @@ class TextRenderer:
             log.warning("[Stage 7] Font not found: %s", exc)
             return canvas
 
-        # ── BiDi reorder for RTL ──────────────────────────────────────────────
-        display_text = text
-        if attrs.is_rtl:
+        is_cjk = target_lang.lower() in ("zh", "ja", "ko")
+
+        # ── Step 1: Determine effective font size (Bug R1/R7 fix) ─────────────
+        # Start at attrs.size_px (= bbox_h) and scale down until the unsplit
+        # text fits within bw. This gives the maximum usable size before wrapping.
+        effective_size = max(6, attrs.size_px)
+        for _ in range(5):
             try:
-                from bidi.algorithm import get_display
-                display_text = get_display(text)
+                _, test_pos = self._shape_text(text, font_path, effective_size)
+                adv = sum(p.x_advance for p in test_pos) >> 6
+                if adv <= bw or effective_size <= 6:
+                    break
+                # Scale down with 5% margin to avoid rounding edge cases
+                effective_size = max(6, int(effective_size * bw / adv * 0.95))
+            except Exception:
+                break
+
+        # ── Step 2: Wrap at effective_size ────────────────────────────────────
+        lines = self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+
+        # ── Step 3: Reduce size further if multi-line overflows height (Bug R3) ─
+        line_height = max(8, int(effective_size * 1.2))   # 120% spacing, not 150%
+        total_h = len(lines) * line_height
+        if total_h > bh and effective_size > 6:
+            fit_scale = (bh / total_h) * 0.92
+            effective_size = max(6, int(effective_size * fit_scale))
+            line_height = max(8, int(effective_size * 1.2))
+            lines = self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+
+        # ── Step 4: Vertically center text block ──────────────────────────────
+        total_h = len(lines) * line_height
+        start_y = max(0, (bh - total_h) // 2)
+
+        # ── Step 5: Build BGRA text layer ─────────────────────────────────────
+        text_layer = np.zeros((bh, bw, 4), dtype=np.uint8)
+
+        # Copy attrs with the computed effective_size for correct glyph metrics
+        eff_attrs = FontAttrs(
+            font_class=attrs.font_class,
+            weight=attrs.weight,
+            is_italic=attrs.is_italic,
+            is_rtl=attrs.is_rtl,
+            size_px=effective_size,
+            text_color=attrs.text_color,
+            bg_color=attrs.bg_color,
+            fallback_level=attrs.fallback_level,
+        )
+
+        for i, line_text in enumerate(lines):
+            ly0 = start_y + i * line_height
+            ly1 = min(bh, ly0 + line_height)
+            if ly0 >= bh or ly1 <= 0:
+                break
+            slot_h = ly1 - ly0
+
+            # ── BiDi reorder for RTL per line ─────────────────────────────────
+            display_text = line_text
+            if attrs.is_rtl:
+                try:
+                    from bidi.algorithm import get_display
+                    display_text = get_display(line_text)
+                except Exception as exc:
+                    log.debug("BiDi failed: %s", exc)
+
+            # ── Shape line at effective_size ───────────────────────────────────
+            try:
+                glyphs, positions = self._shape_text(
+                    display_text, font_path, effective_size)
             except Exception as exc:
-                log.debug("BiDi failed: %s", exc)
+                log.warning("[Stage 7] HarfBuzz shaping failed: %s", exc)
+                glyphs, positions = None, None
 
-        # ── Shape with HarfBuzz ───────────────────────────────────────────────
-        try:
-            glyphs, positions = self._shape_text(
-                display_text, font_path, attrs.size_px)
-        except Exception as exc:
-            log.warning("[Stage 7] HarfBuzz shaping failed: %s", exc)
-            glyphs, positions = None, None
+            # ── Rasterize into a slot_h-tall canvas (Bug R5 fix) ──────────────
+            if glyphs is not None:
+                line_layer = self._rasterize_glyphs(
+                    glyphs, positions, font_path, eff_attrs, bw, slot_h)
+            else:
+                line_layer = self._cv2_fallback_render(
+                    display_text, eff_attrs, bw, slot_h)
 
-        # ── Render glyphs with FreeType ───────────────────────────────────────
-        if glyphs is not None:
-            text_layer = self._rasterize_glyphs(
-                glyphs, positions, font_path, attrs, bw, bh)
-        else:
-            # Fallback: cv2.putText (no shaping)
-            text_layer = self._cv2_fallback_render(
-                display_text, attrs, bw, bh)
-
-        if text_layer is None:
-            return canvas
+            if line_layer is not None:
+                # ── Porter-Duff "over" composite (Bug R4 fix) ─────────────────
+                # Trust the BGRA from _rasterize_glyphs — no solid-row overwrite
+                src = line_layer[:slot_h, :bw].astype(np.float32)
+                dst = text_layer[ly0:ly1, :bw].astype(np.float32)
+                src_a = src[:, :, 3:4] / 255.0
+                dst_a = dst[:, :, 3:4] / 255.0
+                out_a = src_a + dst_a * (1.0 - src_a)
+                out_a_safe = np.where(out_a > 0, out_a, 1.0)
+                out_rgb = (src[:, :, :3] * src_a +
+                           dst[:, :, :3] * dst_a * (1.0 - src_a)) / out_a_safe
+                text_layer[ly0:ly1, :bw, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+                text_layer[ly0:ly1, :bw,  3] = np.clip(
+                    out_a[:, :, 0] * 255, 0, 255).astype(np.uint8)
 
         # ── Contrast check — add outline if contrast < 3:1 ───────────────────
         if _contrast_ratio(attrs.text_color, attrs.bg_color) < 3.0:
-            # draw thin outline in bg colour to ensure readability
             outline_color = attrs.bg_color
             kernel = np.ones((3, 3), np.uint8)
-            if text_layer.shape[2] == 4:
-                alpha_ch = text_layer[:, :, 3]
-                dilated  = cv2.dilate(alpha_ch, kernel, iterations=1)
-                outline_alpha = cv2.subtract(dilated, alpha_ch)
-                outline_layer = np.zeros_like(text_layer)
-                outline_layer[:, :, :3] = outline_color
-                outline_layer[:, :, 3]  = outline_alpha
-                text_layer = self._composite_rgba(text_layer, outline_layer)
+            alpha_ch = text_layer[:, :, 3]
+            dilated  = cv2.dilate(alpha_ch, kernel, iterations=1)
+            outline_alpha = cv2.subtract(dilated, alpha_ch)
+            outline_layer = np.zeros_like(text_layer)
+            outline_layer[:, :, :3] = outline_color
+            outline_layer[:, :, 3]  = outline_alpha
+            text_layer = self._composite_rgba(text_layer, outline_layer)
 
-        # ── Composite onto canvas ─────────────────────────────────────────────
-        th, tw = text_layer.shape[:2]
-        cy2 = min(y + th, canvas.shape[0])
-        cx2 = min(x + tw, canvas.shape[1])
+        # ── Composite onto canvas using Gamma-correct linear blend ────────────
+        cy2 = min(y + bh, canvas.shape[0])
+        cx2 = min(x + bw, canvas.shape[1])
         region = canvas[y:cy2, x:cx2]
 
-        if text_layer.shape[2] == 4:
-            alpha = text_layer[:cy2 - y, :cx2 - x, 3:4].astype(np.float32) / 255.0
-            bgr   = text_layer[:cy2 - y, :cx2 - x, :3].astype(np.float32)
-            region_f = region.astype(np.float32)
-            blended  = bgr * alpha + region_f * (1.0 - alpha)
-            canvas[y:cy2, x:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
-        else:
-            canvas[y:cy2, x:cx2] = text_layer[:cy2 - y, :cx2 - x]
+        alpha = text_layer[:cy2 - y, :cx2 - x, 3:4].astype(np.float32) / 255.0
+
+        f_lin = TextRenderer._srgb_to_linear(text_layer[:cy2 - y, :cx2 - x, :3])
+        b_lin = TextRenderer._srgb_to_linear(region)
+
+        blended_lin = f_lin * alpha + b_lin * (1.0 - alpha)
+        canvas[y:cy2, x:cx2] = TextRenderer._linear_to_srgb(blended_lin).astype(np.uint8)
 
         return canvas
 
@@ -747,21 +939,16 @@ class TextRenderer:
         """
         import uharfbuzz as hb
 
-        key = str(font_path)
+        key = (str(font_path), size_px)
         if key not in self._hb_cache:
             blob = hb.Blob.from_file_path(str(font_path))
             hb_face = hb.Face(blob)
             hb_font = hb.Font(hb_face)
-            # Set font scale in 26.6 fixed-point (size_px << 6)
-            scale = size_px * 64
+            scale = size_px * 64   # 26.6 fixed-point
             hb_font.scale = (scale, scale)
             self._hb_cache[key] = (hb_font, hb_face)
 
         hb_font, _ = self._hb_cache[key]
-
-        # Update scale for this request's size
-        scale = size_px * 64
-        hb_font.scale = (scale, scale)
 
         buf = hb.Buffer()
         buf.add_str(text)
@@ -801,59 +988,60 @@ class TextRenderer:
         """
         Rasterize HarfBuzz-shaped glyph sequence using FreeType.
         Returns BGRA NumPy array sized (bbox_h, max_width, 4).
+
+        Assumes glyph_positions are already shaped at attrs.size_px by the
+        caller (_render_region), which pre-computes the fitting size. No
+        internal scale-down needed — that was the source of glyph/position
+        mismatches (Bug R2).
         """
         import freetype
 
         size_px = attrs.size_px
         face = self._get_ft_face(font_path, size_px)
 
-        # Compute total advance width for adaptive scaling
-        total_advance = sum(pos.x_advance for pos in glyph_positions) >> 6  # 26.6→px
-        if total_advance == 0:
-            return None
-
-        # Adaptive scale-down if text is wider than bbox
-        scale = 1.0
-        if total_advance > max_width and total_advance > 0:
-            scale = max_width / total_advance
-            new_size = max(6, int(size_px * scale))
-            face.set_pixel_sizes(0, new_size)
-            # Re-shape is expensive — approximate by rescaling positions
-            glyph_positions_scaled = [
-                type("P", (), {
-                    "x_advance": int(p.x_advance * scale),
-                    "y_advance": int(p.y_advance * scale),
-                    "x_offset":  int(p.x_offset  * scale),
-                    "y_offset":  int(p.y_offset  * scale),
-                })()
-                for p in glyph_positions
-            ]
-            effective_size = new_size
+        # Apply italic shear via FreeType transformation matrix
+        if attrs.is_italic:
+            import freetype.raw as ft_raw
+            shear = int(0.30 * 0x10000)  # 0.30 in 16.16 fixed-point
+            matrix = freetype.FT_Matrix()
+            matrix.xx = 0x10000
+            matrix.xy = shear
+            matrix.yx = 0
+            matrix.yy = 0x10000
+            delta = freetype.FT_Vector()
+            delta.x = delta.y = 0
+            ft_raw.FT_Set_Transform(face._FT_Face, matrix, delta)
         else:
-            glyph_positions_scaled = list(glyph_positions)
-            effective_size = size_px
+            try:
+                import freetype.raw as ft_raw
+                matrix = freetype.FT_Matrix()
+                matrix.xx = matrix.yy = 0x10000
+                matrix.xy = matrix.yx = 0
+                delta = freetype.FT_Vector()
+                delta.x = delta.y = 0
+                ft_raw.FT_Set_Transform(face._FT_Face, matrix, delta)
+            except Exception:
+                pass
 
-        # Canvas
+        # Canvas sized to the actual line slot height provided by the caller
         layer = np.zeros((bbox_h, max_width, 4), dtype=np.uint8)
 
-        # Baseline position: ~80% down from top
-        baseline_y = int(bbox_h * 0.80)
+        # Total advance width at attrs.size_px (26.6 fixed-point -> px)
+        total_advance = sum(pos.x_advance for pos in glyph_positions) >> 6
+        if total_advance == 0:
+            return layer  # return empty layer, not None
 
-        # RTL: start from right
-        if attrs.is_rtl:
-            total_w = sum(p.x_advance for p in glyph_positions_scaled) >> 6
-            pen_x = max(0, max_width - total_w)
-        else:
-            pen_x = 0
+        # Horizontally center; baseline at 80% of slot height
+        pen_x = max(0, (max_width - total_advance) // 2)
+        pen_y = int(bbox_h * 0.80)
 
-        pen_y = baseline_y
+        tc_bgr = attrs.text_color  # BGR tuple
+        load_flags = freetype.FT_LOAD_RENDER
 
-        tc_bgr = attrs.text_color  # already BGR
-
-        for info, pos in zip(glyph_infos, glyph_positions_scaled):
+        for info, pos in zip(glyph_infos, glyph_positions):
             gid = info.codepoint
             try:
-                face.load_glyph(gid, freetype.FT_LOAD_RENDER)
+                face.load_glyph(gid, load_flags)
             except Exception:
                 continue
 
@@ -865,7 +1053,6 @@ class TextRenderer:
             gx = pen_x + face.glyph.bitmap_left + (pos.x_offset >> 6)
             gy = pen_y - face.glyph.bitmap_top  + (pos.y_offset >> 6)
 
-            # Clamp to layer bounds
             x0  = max(0, gx);    x1  = min(max_width, gx + bm.width)
             y0  = max(0, gy);    y1  = min(bbox_h,    gy + bm.rows)
             bx0 = x0 - gx;       by0 = y0 - gy
@@ -874,18 +1061,17 @@ class TextRenderer:
                 pen_x += pos.x_advance >> 6
                 continue
 
-            glyph_alpha = np.frombuffer(bm.buffer, dtype=np.uint8
+            glyph_alpha = np.array(bm.buffer, dtype=np.uint8
                           ).reshape(bm.rows, bm.width)[by0:by0 + (y1 - y0),
                                                        bx0:bx0 + (x1 - x0)]
 
             layer[y0:y1, x0:x1, 0] = tc_bgr[0]
             layer[y0:y1, x0:x1, 1] = tc_bgr[1]
             layer[y0:y1, x0:x1, 2] = tc_bgr[2]
-            # Accumulate alpha (in case glyphs overlap slightly)
+            # Accumulate alpha (glyphs can overlap on complex/Indic scripts)
             existing = layer[y0:y1, x0:x1, 3].astype(np.uint16)
-            new_alpha = np.minimum(255,
-                        existing + glyph_alpha.astype(np.uint16)).astype(np.uint8)
-            layer[y0:y1, x0:x1, 3] = new_alpha
+            layer[y0:y1, x0:x1, 3] = np.minimum(
+                255, existing + glyph_alpha.astype(np.uint16)).astype(np.uint8)
 
             pen_x += pos.x_advance >> 6
             pen_y -= pos.y_advance >> 6
@@ -905,7 +1091,9 @@ class TextRenderer:
         """
         layer = np.zeros((bh, bw, 4), dtype=np.uint8)
         scale = attrs.size_px / 30.0
-        thickness = max(1, int(scale))
+        # Bug 8 fix: double thickness for BOLD weight
+        base_thickness = max(1, int(scale))
+        thickness = base_thickness * 2 if attrs.weight == FontWeight.BOLD else base_thickness
         font_face = cv2.FONT_HERSHEY_SIMPLEX
 
         (tw, th), baseline = cv2.getTextSize(text, font_face, scale, thickness)
@@ -927,15 +1115,19 @@ class TextRenderer:
     @staticmethod
     def _composite_rgba(front: np.ndarray,
                          back:  np.ndarray) -> np.ndarray:
-        """Alpha-composite `back` under `front` (both BGRA)."""
+        """Alpha-composite `back` under `front` (both BGRA) using linear light."""
         fa = front[:, :, 3:4].astype(np.float32) / 255.0
         ba = back[ :, :, 3:4].astype(np.float32) / 255.0
         out_a = fa + ba * (1.0 - fa)
-        out_bgr = (front[:, :, :3].astype(np.float32) * fa +
-                   back[ :, :, :3].astype(np.float32) * ba * (1.0 - fa))
+        
+        f_lin = TextRenderer._srgb_to_linear(front[:, :, :3])
+        b_lin = TextRenderer._srgb_to_linear(back[:, :, :3])
+        
+        out_bgr_lin = (f_lin * fa + b_lin * ba * (1.0 - fa))
         out_a_safe = np.where(out_a > 0, out_a, 1.0)
-        out_bgr /= out_a_safe
+        out_bgr_lin /= out_a_safe
+        
         result = np.zeros_like(front)
-        result[:, :, :3] = np.clip(out_bgr, 0, 255).astype(np.uint8)
-        result[:, :, 3]  = np.clip(out_a * 255, 0, 255).astype(np.uint8)
+        result[:, :, :3] = TextRenderer._linear_to_srgb(out_bgr_lin).astype(np.uint8)
+        result[:, :, 3:4] = np.clip(out_a * 255, 0, 255).astype(np.uint8)
         return result
