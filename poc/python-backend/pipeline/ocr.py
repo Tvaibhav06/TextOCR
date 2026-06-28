@@ -34,8 +34,10 @@ import numpy as np
 log = logging.getLogger("textremover.ocr")
 
 # ── Confidence gate constants ─────────────────────────────────────────────────
-MIN_CONFIDENCE: float = 0.40   # Regions below this are skipped (noise threshold)
-MIN_TEXT_LEN:   int   = 2      # Single-char noise skipped; 2+ chars are kept
+MIN_CONFIDENCE: float = 0.60   # Regions below this are skipped (noise threshold)
+MIN_TEXT_LEN:   int   = 3      # 1-2 char noise skipped; 3+ chars are kept
+# Regions between LOW_CONF and MIN_CONFIDENCE get low_conf_text set (for border fallback)
+LOW_CONF_FLOOR: float = 0.25   # Below this even low-conf fallback is ignored
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -43,14 +45,17 @@ MIN_TEXT_LEN:   int   = 2      # Single-char noise skipped; 2+ chars are kept
 @dataclass
 class OcrResult:
     """OCR result for a single detection region."""
-    det_id:     int
-    text:       str
-    confidence: float
-    skip:       bool    # True → keep erased only; do not translate or render
-    x:          int     # bbox from Detection (pixel coords)
-    y:          int
-    w:          int
-    h:          int
+    det_id:        int
+    text:          str
+    confidence:    float
+    skip:          bool    # True → keep erased only; do not translate or render
+    x:             int     # bbox from Detection (pixel coords)
+    y:             int
+    w:             int
+    h:             int
+    low_conf_text: str = ""  # Non-empty when conf in [LOW_CONF_FLOOR, MIN_CONFIDENCE).
+                             # Stage 7 uses this to draw a border fallback instead of
+                             # leaving a fully blank hole.
 
 
 # ── Helper: crop + deskew a polygon region ────────────────────────────────────
@@ -183,14 +188,18 @@ class RegionOCR:
             "ta": "ta", "te": "te", "kn": "ka",
             "pa": "en", # Fallback to en/latin as paddleocr v4 default doesn't explicitly bundle pa
             "en": "en",
+            "zh": "ch", "ja": "japan", "ko": "korean",  # explicit CJK routing
         }
-        
+
         if source_lang_hint == "und":
-            paddle_lang = "ch" # Default multilingual model (English + Chinese) if completely unknown
+            # Default to English recognizer — safer for the common case of Latin
+            # text with unknown source lang. CJK hints arrive via the crop-probe
+            # in api/main.py before this method is called.
+            paddle_lang = "en"
         elif source_lang_hint in hint_map:
             paddle_lang = hint_map[source_lang_hint]
         else:
-            paddle_lang = "en" # Fallback to english for pure latin/unknown
+            paddle_lang = "en"  # Fallback to english for pure latin/unknown
             
         self._ensure_loaded(paddle_lang)
         results: List[OcrResult] = []
@@ -202,6 +211,13 @@ class RegionOCR:
             text, conf = self._recognize_crop(crop, det.id, paddle_lang)
             skip = (conf < MIN_CONFIDENCE or len(text.strip()) < MIN_TEXT_LEN)
 
+            # Capture near-threshold text for Stage 7 border fallback.
+            # If OCR read something between LOW_CONF_FLOOR and MIN_CONFIDENCE
+            # we preserve it so the renderer can draw a border instead of blank.
+            low_conf_text = ""
+            if skip and conf >= LOW_CONF_FLOOR and text.strip():
+                low_conf_text = text.strip()
+
             results.append(OcrResult(
                 det_id=det.id,
                 text=text,
@@ -211,6 +227,7 @@ class RegionOCR:
                 y=det.bbox.y,
                 w=det.bbox.w,
                 h=det.bbox.h,
+                low_conf_text=low_conf_text,
             ))
 
             if skip:

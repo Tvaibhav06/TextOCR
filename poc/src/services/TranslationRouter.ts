@@ -87,6 +87,7 @@ export interface TranslationRouterResult {
   
   /** Populated on PC path only. List of translated strings for the testing popup. */
   pcTranslatedTexts?: string[];
+  pcSourceLangs?: string[];
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -103,7 +104,7 @@ export class TranslationRouter {
     result:     PipelineResult,
     targetLang: string,
     onProgress?: (stage: string, detail?: string) => void,
-    forceMode?: 'mobile' | 'pc',
+    preferredPath: 'mobile' | 'pc' = 'mobile',
     existingOcrResults?: MobileOcrResult[],
   ): Promise<TranslationRouterResult> {
     const t0 = Date.now();
@@ -124,35 +125,39 @@ export class TranslationRouter {
       };
     }
 
-    // ── Try mobile path ───────────────────────────────────────────────────────
-    if (forceMode !== 'pc') {
-      onProgress?.('mobile_start', `Translating to ${targetLang} on device…`);
+    if (preferredPath === 'mobile') {
+      // ── Preferred Mobile (default) ──────────────────────────────────────────
+      onProgress?.('mobile_start', `Translating on device…`);
 
       const mobileResult = await this._tryMobilePath(
         result, targetLang, originalUri, detections, t0, onProgress,
       );
 
+      // Return mobile result if successful
       if (mobileResult) return mobileResult;
 
-      if (forceMode === 'mobile') {
-        return {
-          path:            'failed',
-          fallbackReason:  'mobile_translate_error',
-          fallbackDetail:  'Forced mobile path failed or fell below quality thresholds.',
-          outputUri:       result.outputUri,
-          originalUri,
-          targetLang,
-          mobileData:      null,
-          totalMs:         Date.now() - t0,
-          translatedCount: 0,
-          detectionCount:  detections.length,
-        };
-      }
-    }
+      // Mobile failed, fallback to PC
+      onProgress?.('pc_start', 'Device translation failed. Falling back to PC…');
+      return this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults);
 
-    // ── Mobile failed — try PC fallback ───────────────────────────────────────
-    onProgress?.('pc_start', forceMode === 'pc' ? 'Translating on PC server…' : 'Falling back to PC server for translation…');
-    return this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults);
+    } else {
+      // ── Preferred PC ────────────────────────────────────────────────────────
+      onProgress?.('pc_start', 'Translating on PC server…');
+      const pcResult = await this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults);
+
+      // Return PC result if successful
+      if (pcResult.path === 'pc') return pcResult;
+
+      // PC failed, fallback to Mobile
+      onProgress?.('mobile_start', 'PC translation failed. Falling back to device…');
+      const mobileFallback = await this._tryMobilePath(
+        result, targetLang, originalUri, detections, t0, onProgress,
+      );
+
+      // Return mobile result if successful, otherwise return the original PC failure
+      if (mobileFallback) return mobileFallback;
+      return pcResult;
+    }
   }
 
   // ── Private: mobile path ──────────────────────────────────────────────────
@@ -302,8 +307,8 @@ export class TranslationRouter {
       originalUri,
       targetLang,
       baseUrl,
-      result.width ?? 0,
-      result.height ?? 0,
+      result.width ?? 1,
+      result.height ?? 1,
       result.detections,
       existingOcrResults,
     );
@@ -340,6 +345,7 @@ export class TranslationRouter {
       translatedCount: pcResult.translations,
       detectionCount:  pcResult.detections,
       pcTranslatedTexts: pcResult.pcTranslatedTexts,
+      pcSourceLangs: pcResult.pcSourceLangs,
     };
   }
 

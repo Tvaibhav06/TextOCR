@@ -34,6 +34,7 @@ from pipeline.ocr import (
     _crop_deskew,
     MIN_CONFIDENCE,
     MIN_TEXT_LEN,
+    LOW_CONF_FLOOR,
 )
 
 
@@ -163,6 +164,19 @@ class TestOcrResult:
     def test_min_text_len_constant_matches_spec(self):
         assert MIN_TEXT_LEN == 3
 
+    def test_low_conf_floor_constant_exists(self):
+        assert LOW_CONF_FLOOR == 0.25
+
+    def test_skip_true_when_confidence_below_min_confidence(self):
+        r = OcrResult(det_id=0, text="ABC", confidence=0.55, skip=True,
+                      x=0, y=0, w=50, h=20)
+        assert r.skip is True
+
+    def test_low_conf_text_field_exists(self):
+        r = OcrResult(det_id=0, text="", confidence=0.0, skip=True,
+                      x=0, y=0, w=10, h=10, low_conf_text="maybe")
+        assert r.low_conf_text == "maybe"
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # SUITE 3: RegionOCR — mock-based (no model loading)
@@ -175,9 +189,9 @@ class TestRegionOCRMocked:
     """
 
     def _make_ocr_with_mock(self, mock_results):
-        """Build a RegionOCR instance whose _rec is mocked."""
+        """Build a RegionOCR instance whose _recs dict is mocked."""
         ocr = RegionOCR.__new__(RegionOCR)
-        ocr._rec = None
+        ocr._recs = {}   # Initialize the lang-keyed cache dict
 
         class MockRec:
             def __init__(self, results):
@@ -189,7 +203,12 @@ class TestRegionOCRMocked:
                 self._call_count += 1
                 return r
 
-        ocr._rec = MockRec(mock_results)
+        # Inject the mock under the default key that ocr.py will look up.
+        # The pure-PC path defaults to 'en' when hint='und', so we pre-populate
+        # both 'en' and 'ch' to ensure tests work regardless of hint.
+        mock_rec = MockRec(mock_results)
+        ocr._recs["en"] = mock_rec
+        ocr._recs["ch"] = mock_rec
         return ocr
 
     def test_run_returns_one_result_per_detection(self, mock_detections, text_image):

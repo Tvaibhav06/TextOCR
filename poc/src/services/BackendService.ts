@@ -375,6 +375,7 @@ class BackendService {
     detections:      number;
     translations:    number;
     pcTranslatedTexts?: string[];
+    pcSourceLangs?: string[];
   } | null> {
     const endpoint = baseUrl.replace(/\/$/, '') + '/api/process-translate';
 
@@ -473,6 +474,7 @@ class BackendService {
       const detections:        number   = parseInt(json.detections   ?? 0, 10);
       const translations:      number   = parseInt(json.translations ?? 0, 10);
       const pcTranslatedTexts: string[] = Array.isArray(json.translated_texts) ? json.translated_texts : [];
+      const pcSourceLangs:     string[] = Array.isArray(json.source_langs) ? json.source_langs : [];
       const image_b64:         string   = json.image_b64 ?? '';
 
       console.log(`[BackendService] Translate result: ${translations}/${detections} regions  ${totalMs}ms`);
@@ -497,7 +499,7 @@ class BackendService {
       });
       console.log('[BackendService] Translate result saved to cache:', resultUri);
 
-      return { resultUri, totalMs, detections, translations, pcTranslatedTexts };
+      return { resultUri, totalMs, detections, translations, pcTranslatedTexts, pcSourceLangs };
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         console.error(`[BackendService] Translate timed out (${UPLOAD_TIMEOUT_MS / 1000}s).`);

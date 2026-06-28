@@ -62,6 +62,15 @@ _FONTS = [
     ("NotoSansHebrew-Regular.ttf", f"{_BASE_URL}/NotoSansHebrew/hinted/ttf/NotoSansHebrew-Regular.ttf"),
     # Noto Serif Devanagari (serif fallback for hi/mr)
     ("NotoSerifDevanagari-Regular.ttf", f"{_BASE_URL}/NotoSerifDevanagari/hinted/ttf/NotoSerifDevanagari-Regular.ttf"),
+
+    # ── CJK — Simplified Chinese / Traditional Chinese / Japanese / Korean ──────
+    # Unified TTC covers all four CJK orthographies.  ~16 MB each.
+    # Required for non-tofu rendering of zh / ja / ko target languages.
+    # Source: github.com/googlefonts/noto-cjk (SIL Open Font License)
+    ("NotoSansCJK-Regular.ttc",
+     "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"),
+    ("NotoSansCJK-Bold.ttc",
+     "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Bold.ttc"),
 ]
 
 FONTS_DIR = Path(__file__).parent.parent / "pipeline" / "fonts"

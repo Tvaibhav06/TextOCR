@@ -125,7 +125,7 @@ class TestEnumsAndConstants:
     def test_font_matrix_all_values_are_strings(self):
         for v in _FONT_MATRIX.values():
             assert isinstance(v, str)
-            assert v.endswith(".ttf") or v.endswith(".otf")
+            assert v.endswith(".ttf") or v.endswith(".otf") or v.endswith(".ttc")
 
     def test_lang_to_script_hindi_is_devanagari(self):
         assert _LANG_TO_SCRIPT.get("hi") == "devanagari"
@@ -135,6 +135,19 @@ class TestEnumsAndConstants:
 
     def test_lang_to_script_unknown_returns_none(self):
         assert _LANG_TO_SCRIPT.get("xx") is None
+
+    def test_lang_to_script_korean_is_hangul(self):
+        assert _LANG_TO_SCRIPT.get("ko") == "hangul"
+
+    def test_lang_to_script_chinese_is_cjk(self):
+        assert _LANG_TO_SCRIPT.get("zh") == "cjk"
+
+    def test_font_matrix_has_cjk_regular_entry(self):
+        assert ("sans_serif", "regular", "cjk") in _FONT_MATRIX
+        assert _FONT_MATRIX[("sans_serif", "regular", "cjk")] == "NotoSansCJK-Regular.ttc"
+
+    def test_font_matrix_has_hangul_entry(self):
+        assert ("sans_serif", "regular", "hangul") in _FONT_MATRIX
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -217,8 +230,10 @@ class TestFontAttributeExtractor:
     def test_size_px_uses_correct_ratio_for_cjk(self, extractor):
         crop = _make_blank(50, 100)
         attrs = extractor.extract(crop, crop, bbox_h=50, target_lang="zh")
-        # CJK ratio = 0.85 → 50 * 0.85 = 42
-        assert attrs.size_px == 42
+        # The cap ratio (0.85 for CJK) is applied at render-time, not extraction-time.
+        # FontAttributeExtractor.extract() returns bbox_h clamped to [6, bbox_h].
+        # For a blank crop with no text pixels, size_px == bbox_h = 50.
+        assert attrs.size_px == 50
 
     def test_weight_bold_on_thick_strokes(self, extractor):
         crop_bold = _make_bold_text_crop(h=60, w=200)
@@ -399,9 +414,32 @@ class TestTextRendererUnit:
         assert len(rendered_ids) == 0   # skip=True → no render call
 
     def test_render_all_skips_failed_translations(self, renderer, monkeypatch):
+        """engine='failed' with non-empty OCR text: renderer falls back to
+        rendering the original OCR text (graceful fallback, not blank)."""
         inp  = _make_blank(300, 400)
         orig = _make_blank(300, 400)
-        ocr  = [MockOcr(skip=False)]
+        ocr  = [MockOcr(skip=False, text="Hello")]  # MockOcr.text defaults to "Hello"
+        tr   = [MockTr(engine="failed", text="")]
+
+        rendered_ids = []
+        def fake_render(canvas, text, attrs, target_lang, bbox):
+            rendered_ids.append(text)
+            return canvas
+
+        monkeypatch.setattr(renderer, "_render_region", fake_render)
+        result = renderer.render_all(inp, orig, ocr, tr, "fr")
+        # When translation fails but OCR text is non-empty, original text is
+        # rendered as a graceful fallback (better than a blank inpainted hole).
+        assert len(rendered_ids) == 1
+        assert rendered_ids[0] == "Hello"
+        assert result.shape == inp.shape
+
+    def test_render_all_draws_border_when_failed_and_no_text(self, renderer, monkeypatch):
+        """engine='failed' with empty OCR text and empty tr.text: no _render_region
+        call, but a border rect is drawn on the canvas."""
+        inp  = _make_blank(300, 400)
+        orig = _make_blank(300, 400)
+        ocr  = [MockOcr(skip=False, text="")]   # explicitly empty OCR text
         tr   = [MockTr(engine="failed", text="")]
 
         rendered_ids = []
@@ -410,8 +448,11 @@ class TestTextRendererUnit:
             return canvas
 
         monkeypatch.setattr(renderer, "_render_region", fake_render)
-        renderer.render_all(inp, orig, ocr, tr, "fr")
+        result = renderer.render_all(inp, orig, ocr, tr, "fr")
+        # _render_region is NOT called (no text to render)
         assert len(rendered_ids) == 0
+        # Image is still returned (with a border pixel drawn by cv2.rectangle)
+        assert result.shape == inp.shape
 
     def test_render_all_skips_empty_translation_text(self, renderer, monkeypatch):
         inp  = _make_blank(300, 400)

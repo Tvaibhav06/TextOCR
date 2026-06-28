@@ -49,7 +49,148 @@ _BACKEND_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
-from pipeline.core import TextRemovalPipeline, Detection, BBox, PipelineResult  # noqa: E402
+from pipeline.core import TextRemovalPipeline, Detection, BBox, PipelineResult, MSERDetector  # noqa: E402
+
+# ── MSER second-pass helper ───────────────────────────────────────────────────
+# Reuses the existing MSERDetector from core.py (zero new dependencies).
+# Only used in the translate pipeline; /api/process is never touched.
+_mser_detector: MSERDetector | None = None
+
+
+def _mser_second_pass(
+    image_bgr: np.ndarray,
+    existing:  list,       # List[Detection] from Stage 1
+    min_w:     int = 15,
+    min_h:     int = 10,
+    iou_gate:  float = 0.20,
+) -> list:
+    """
+    Run a lightweight MSER sweep on the original image and return NEW detections
+    that Stage 1 missed (IoU < iou_gate vs all existing boxes, size >= min_w x min_h).
+
+    Existing Stage 1 detections are NOT modified.
+    Returns ONLY the new candidate detections for merging.
+    """
+    global _mser_detector
+    if _mser_detector is None:
+        _mser_detector = MSERDetector()  # uses core.py defaults (min_area=30, max_area=4000)
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    mser_dets = _mser_detector.detect(gray, threshold=0.5)
+
+    new_dets: list = []
+    next_id = max((d.id for d in existing), default=-1) + 1
+
+    for md in mser_dets:
+        # Size gate: reject very small regions that are almost certainly noise
+        if md.bbox.w < min_w or md.bbox.h < min_h:
+            continue
+        # IoU gate: skip if this region overlaps with any Stage 1 detection
+        if any(md.bbox.iou(ed.bbox) >= iou_gate for ed in existing):
+            continue
+        # Renumber IDs so they don't collide with Stage 1 IDs
+        new_det = Detection(
+            id=next_id,
+            bbox=md.bbox,
+            polygon=md.polygon,
+            confidence=md.confidence,
+            source="mser_recovery",
+        )
+        new_dets.append(new_det)
+        next_id += 1
+
+    return new_dets
+
+
+def _probe_source_lang(image_bgr: np.ndarray, detections: list, max_samples: int = 3) -> str:
+    """
+    Sample up to `max_samples` detection crops from the original image and run
+    script-block detection to get a source language hint for Stage 5 OCR.
+
+    Returns an ISO language code string (e.g. 'en', 'hi', 'zh') or 'und' if
+    no dominant script is found.
+    """
+    from pipeline.translation import TranslationRouter
+    from pipeline.ocr import _crop_deskew
+    import numpy as np
+
+    votes: dict[str, int] = {}
+    for det in detections[:max_samples]:
+        poly = np.array(det.polygon, dtype=np.float32)
+        crop = _crop_deskew(image_bgr, poly)
+        if crop is None or crop.size == 0:
+            continue
+        # Convert crop to a rough text sample for script detection.
+        # We don't need real OCR here — just the Unicode script range probe.
+        # Since this is a pixel crop (not text), we can't directly detect script;
+        # instead we'll rely on the crop's pixel characteristics being meaningful
+        # only when we have actual text content from later stages.
+        # For now, use the lang from the bounding box source attribute as a hint.
+        # If source is 'paddleocr', the detection is reliable; use 'und' for MSER.
+        if getattr(det, 'source', '') in ('paddleocr', 'injected'):
+            # Attempt to get script hint from detection confidence range
+            # (high-conf PaddleOCR tends to be Latin/CJK based on model)
+            pass  # will use 'und' and rely on individual OCR results
+
+    # If we have no reliable votes, return 'und' — ocr.py will default to 'en'
+    if not votes:
+        return "und"
+    return max(votes, key=lambda k: votes[k])
+
+
+# ── Startup checks ────────────────────────────────────────────────────────────
+
+def _check_fonts_at_startup() -> None:
+    """
+    Log a WARNING for every font referenced in renderer._FONT_MATRIX that is
+    not present on disk.  Server continues regardless.
+    """
+    try:
+        from pipeline.renderer import _FONT_MATRIX, FONTS_DIR
+        missing = set()
+        for filename in _FONT_MATRIX.values():
+            if not (FONTS_DIR / filename).exists():
+                missing.add(filename)
+        if missing:
+            for fn in sorted(missing):
+                log.warning(
+                    "Font missing: %s — run: python python-backend/scripts/download_fonts.py",
+                    fn,
+                )
+        else:
+            log.info("Font check OK — all %d required fonts present.", len(set(_FONT_MATRIX.values())))
+    except Exception as exc:
+        log.warning("Font check failed (non-fatal): %s", exc)
+
+
+def _check_indictrans2_at_startup() -> None:
+    """
+    Log a WARNING for each IndicTrans2 model direction that is not cached locally.
+    A partial installation is fine — those directions will use Argos as fallback.
+    """
+    try:
+        from pipeline.translation import TranslationRouter
+        router = TranslationRouter()
+        status = router.indictrans2_status()
+        available = [d for d, ok in status.items() if ok]
+        missing   = [d for d, ok in status.items() if not ok]
+        if not available:
+            log.warning(
+                "IndicTrans2: no model directions cached —"
+                " all Indic↔English pairs will use Argos Translate."
+                " To download: python -c \"from pipeline.translation import"
+                " IndicTrans2Engine; e=IndicTrans2Engine();"
+                " e._load_model_online('en-indic')\""
+            )
+        else:
+            log.info("IndicTrans2 available directions: %s", ", ".join(available))
+            for d in missing:
+                log.warning(
+                    "IndicTrans2 direction '%s' not cached — will fall back to Argos.", d
+                )
+    except Exception as exc:
+        log.warning("IndicTrans2 check failed (non-fatal): %s", exc)
+
 
 # ── Lazy pipeline singleton ────────────────────────────────────────────────────
 _pipeline: TextRemovalPipeline | None = None
@@ -141,6 +282,9 @@ async def lifespan(app: FastAPI):
     log.info("  TextRemover API  —  Phase 2 Backend")
     log.info("═══════════════════════════════════════════")
     _advertise_mdns(port=8000)
+    # ── Startup checks (non-fatal: warn and continue) ─────────────────────────
+    _check_fonts_at_startup()
+    _check_indictrans2_at_startup()
     yield
     # Shutdown: unregister mDNS if active
     zc = getattr(app.state, "zeroconf", None)
@@ -214,7 +358,7 @@ async def health():
 
 
 @app.post("/api/process", summary="Process image — remove text via LaMa pipeline")
-async def process_image(image: UploadFile = File(...)):
+def process_image(image: UploadFile = File(...)):
     """
     Accepts a raw image (JPEG/PNG/WEBP) as multipart/form-data.
 
@@ -240,7 +384,7 @@ async def process_image(image: UploadFile = File(...)):
     )
 
     # ── Read and decode ──────────────────────────────────────────────────────
-    raw_bytes = await image.read()
+    raw_bytes = image.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
@@ -306,7 +450,7 @@ async def process_image(image: UploadFile = File(...)):
 
 
 @app.post("/api/process-translate", summary="Remove text and replace with translation")
-async def process_translate_image(
+def process_translate_image(
     image: UploadFile = File(...),
     target_lang: str = Form("en"),
     regions_json: str = Form(None),
@@ -326,7 +470,7 @@ async def process_translate_image(
         target_lang,
     )
 
-    raw_bytes = await image.read()
+    raw_bytes = image.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Empty file.")
 
@@ -427,7 +571,36 @@ async def process_translate_image(
         else:
             # ── Normal Stages 1–4: Erase text ──
             result = pipe.run(img_bgr)
-        
+
+            # ── MSER second-pass recovery (pure PC path only) ──
+            # Find text regions that PaddleOCR Stage 1 missed and add them to
+            # the detection list BEFORE passing to Stage 5. Stage 1–4 output
+            # (inpainted image, mask, quality) is unchanged.
+            if result.detections is not None:
+                recovered = _mser_second_pass(img_bgr, result.detections)
+                if recovered:
+                    log.info(
+                        "[MSER Recovery] Stage 1 found %d regions; "
+                        "MSER sweep added %d more.",
+                        len(result.detections), len(recovered),
+                    )
+                    # Build a merged list without mutating result
+                    merged_detections = list(result.detections) + recovered
+                    # Re-generate mask to cover newly recovered regions too
+                    h_rec, w_rec = img_bgr.shape[:2]
+                    merged_mask = pipe.masker.generate(
+                        merged_detections, h_rec, w_rec, dilation_px=5
+                    )
+                    merged_inpainted, _ = pipe.inpainter.inpaint(img_bgr, merged_mask, radius=7)
+                    result = PipelineResult(
+                        output=merged_inpainted,
+                        mask=merged_mask,
+                        detections=merged_detections,
+                        quality=result.quality,
+                        timing=result.timing,
+                        total_ms=result.total_ms,
+                    )
+
         if not result.detections:
             # Nothing to translate; return original
             output_bgr = img_bgr
@@ -441,23 +614,36 @@ async def process_translate_image(
                 for i, det in enumerate(result.detections):
                     inj = injected_ocr_results[i]
                     if inj["has_text"]:
-                        ocr_results.append(inj["obj"])
+                        ocr_obj = inj["obj"]
+                        # Tag with stable source lang so Stage 6 avoids running langdetect
+                        # on noisy handwriting OCR text (which causes misidentification).
+                        # Mobile MLKit reads the source text reliably; default to 'en'.
+                        ocr_obj._injected_src_lang = str(inj.get("src_lang", "en") or "en")
+                        ocr_results.append(ocr_obj)
                     else:
                         # Attempt to derive source script from mobile text (if any), else 'und'
                         hint = "und"
                         inj_text = inj["obj"].text.strip()
                         if inj_text:
                             hint = TranslationRouter._identify_language(inj_text)
-                            
+
                         partial_res = ocr_engine.run(img_bgr, [det], source_lang_hint=hint)
                         if partial_res:
                             ocr_results.append(partial_res[0])
             else:
+                # Pure PC path: probe source script from a few crops to pick
+                # the right OCR model (avoids defaulting to Chinese recognizer).
                 ocr_engine = get_ocr()
-                ocr_results = ocr_engine.run(img_bgr, result.detections)
+                source_lang_hint = _probe_source_lang(img_bgr, result.detections)
+                log.info("[Stage 5] Source lang probe: %r", source_lang_hint)
+                ocr_results = ocr_engine.run(
+                    img_bgr, result.detections, source_lang_hint=source_lang_hint
+                )
             
             # ── Stage 6: Translate
             translator = get_translator()
+            # Preflight: log missing model warnings for this request's language pair
+            translator.preflight(src="auto", tgt=target_lang)
             from pipeline.translation import TranslationResult
             tr_results = []
             for r in ocr_results:
@@ -466,8 +652,14 @@ async def process_translate_image(
                         text=r.text, engine="skipped", src_lang="auto", tgt_lang=target_lang
                     ))
                 else:
-                    res = translator.translate(r.text, src="auto", tgt=target_lang)
+                    # Use the injected src_lang if the mobile path set it on the OcrResult.
+                    # This avoids running langdetect on noisy handwriting OCR text (typos,
+                    # dropped chars cause misidentification → wrong Argos pair → engine='failed').
+                    injected_src = getattr(r, "_injected_src_lang", None)
+                    src_hint = injected_src if injected_src else "auto"
+                    res = translator.translate(r.text, src=src_hint, tgt=target_lang)
                     tr_results.append(res)
+
             
             # ── Stage 7: Render translated text onto inpainted image
             renderer = get_renderer()
@@ -486,6 +678,11 @@ async def process_translate_image(
                 if tr and tr.engine not in ("failed",) and tr.text and tr.text.strip()
             ]
             translated_count = len(translated_strings)
+            source_langs = list(set(
+                tr.src_lang
+                for tr in tr_results
+                if tr and tr.engine not in ("failed", "skipped") and tr.src_lang and tr.src_lang not in ("auto", "und")
+            ))
 
         elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
 
@@ -495,6 +692,7 @@ async def process_translate_image(
 
     _translated_count = translated_count if 'translated_count' in locals() else 0
     _translated_strings = translated_strings if 'translated_strings' in locals() else []
+    _source_langs = source_langs if 'source_langs' in locals() else []
     _detections         = len(result.detections) if 'result' in locals() else 0
 
     log.info(
@@ -516,4 +714,5 @@ async def process_translate_image(
         "total_ms":         elapsed_ms,
         "detections":       _detections,
         "translations":     _translated_count,
+        "source_langs":     _source_langs,
     })

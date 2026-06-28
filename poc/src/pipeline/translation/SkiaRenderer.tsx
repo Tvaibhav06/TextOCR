@@ -23,12 +23,13 @@
  *    "typefacesToLoad[familyName].map is not a function" crash.
  */
 
-import React, { useEffect, useMemo, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { View, LayoutChangeEvent, ActivityIndicator, Text as RNText, StyleSheet } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import {
   Canvas,
   Image,
+  ImageFormat,
   Paragraph,
   RoundedRect,
   Skia,
@@ -71,6 +72,13 @@ export interface SkiaRendererProps {
    * totalCount    = total non-skipped, non-failed regions.
    */
   onRenderComplete?: (renderedCount: number, totalCount: number) => void;
+  /**
+   * Called once with the file:// URI of a flattened JPEG snapshot that combines
+   * the inpainted background and all translated-text paragraphs.
+   * Intended for Save / Share — avoids saving only the bare background image.
+   * Fires asynchronously after onRenderComplete; never crashes the overlay if it fails.
+   */
+  onSnapshot?: (uri: string) => void;
 }
 
 // ── RTL language codes ────────────────────────────────────────────────────────
@@ -108,8 +116,13 @@ function estimateFontSize(bboxH: number, lang: string): number {
 //
 // Notes:
 //   - Malayalam: NotoSansMalayalam-Regular.ttf now bundled (Stage 7 P1 complete).
-//   - CJK (zh/ja/ko): No CJK Noto bundled (file size ~30MB). Falls back to NotoSans-Regular.
-//     This renders tofu boxes for CJK — acceptable for POC; PC path handles CJK correctly.
+//   - CJK (zh/ja/ko): No CJK Noto bundled (file size ~30MB).
+//     Returns SYSTEM_FONT sentinel → buildParagraph uses the device system font
+//     manager (null) with 'sans-serif', which resolves to Noto Sans CJK on
+//     Android and PingFang SC / Hiragino on iOS. No tofu boxes.
+
+/** Sentinel returned by getFontAssetName for CJK languages. */
+const SYSTEM_FONT = 'SYSTEM';
 
 function getFontAssetName(fontClass: FontClass, weight: FontWeight, lang: string): string {
   const lc   = lang.toLowerCase();
@@ -131,7 +144,8 @@ function getFontAssetName(fontClass: FontClass, weight: FontWeight, lang: string
     return bold ? 'NotoNaskhArabic-Bold' : 'NotoNaskhArabic-Regular';
   }
   if (lc === 'he') return 'NotoSansHebrew-Regular';
-  if (['zh','ja','ko'].includes(lc))   return 'NotoSans-Regular';  // no CJK font bundled → L2
+  // CJK: no bundled font — return sentinel so buildParagraph uses the system font manager
+  if (['zh','ja','ko'].includes(lc)) return SYSTEM_FONT;
 
   // ── Latin / Cyrillic / default — use font class and weight ───────────────
   if (fontClass === 'SERIF') {
@@ -332,6 +346,130 @@ export function estimateWeight(
   return strokePx >= 5.0 ? 'BOLD' : 'REGULAR';
 }
 
+// ── Italic detection ─────────────────────────────────────────────────────────
+//
+// Port of PC's _detect_italic (renderer.py) using row-centroid linear regression.
+// For each row in the binarized crop, compute the mean X position of foreground
+// pixels. A linear regression slope over (row_y, centroid_x) gives the lean angle.
+//
+// Returns the slope value (= tan of the lean angle, usable directly as skewX)
+// or null if no clear tilt is detected.
+
+export function estimateItalicSlant(
+  rgbaPixels: Uint8Array,
+  width:      number,
+  height:     number,
+): number | null {
+  // Guard: need minimum region size and word-like aspect ratio
+  if (!rgbaPixels || width < 16 || height < 8) return null;
+  if (width < height * 2) return null; // single tall character — skip
+
+  // Grayscale + Otsu binarization
+  const gray = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    gray[i] = Math.round(
+      0.299 * rgbaPixels[i*4] + 0.587 * rgbaPixels[i*4+1] + 0.114 * rgbaPixels[i*4+2]
+    );
+  }
+  const hist = new Array(256).fill(0);
+  for (const v of gray) hist[v]++;
+  const total = width * height;
+  let sumAll = 0;
+  for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+  let wB = 0, sumB = 0, maxVar = 0, thr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+    const v = wB * wF * (mB - mF) ** 2;
+    if (v > maxVar) { maxVar = v; thr = t; }
+  }
+  thr = Math.max(1, Math.min(254, thr));
+  const darkCount = gray.filter(v => v < thr).length;
+  const binary    = new Uint8Array(total);
+  if (darkCount < total * 0.5) {
+    for (let i = 0; i < total; i++) binary[i] = gray[i] < thr ? 255 : 0;
+  } else {
+    for (let i = 0; i < total; i++) binary[i] = gray[i] >= thr ? 255 : 0;
+  }
+
+  const fgCount = binary.reduce((s, v) => s + (v > 0 ? 1 : 0), 0);
+  if (fgCount < 50) return null; 
+
+  const rowCount: number[] = new Array(height).fill(0);
+  const rowSumX: number[]  = new Array(height).fill(0);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (binary[y * width + x] > 0) {
+        rowCount[y]++;
+        rowSumX[y] += x;
+      }
+    }
+  }
+
+  const minRowFg = Math.max(1, Math.floor(width * 0.05));
+  const pairs: [number, number][] = [];
+  for (let y = 0; y < height; y++) {
+    if (rowCount[y] >= minRowFg) {
+      pairs.push([y, rowSumX[y] / rowCount[y]]);
+    }
+  }
+  if (pairs.length < 10) return null; 
+
+  let n = pairs.length, sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+  for (const [py, px] of pairs) { 
+    sumX += py; 
+    sumY += px; 
+    sumXY += py * px; 
+    sumX2 += py * py; 
+    sumY2 += px * px;
+  }
+  
+  const denom = n * sumX2 - sumX * sumX;
+  if (Math.abs(denom) < 1e-9) return null;
+  
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const num = n * sumXY - sumX * sumY;
+  const den = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+  const r = den === 0 ? 0 : num / den;
+
+  // slope is ∆centroid_x / ∆row. Convert to angle from vertical in degrees.
+  const angleFromVert = Math.abs(Math.atan(slope) * 180 / Math.PI);
+
+  // Thresholds are intentionally tight to prevent handwriting false-positives:
+  //
+  //   angle > 12°   — True italic fonts lean 10–15°. Handwriting baseline
+  //                    variation rarely exceeds 8° uniformly across a word.
+  //
+  //   |r| > 0.88    — True italic produces a very consistent linear centroid
+  //                    shift across rows (high r). Handwriting pixel noise gives
+  //                    lower r even when it looks slanted visually.
+  //
+  //   pairs ≥ 10    — Need enough rows to get a reliable regression.
+  //
+  //   width ≥ h*2   — Require a clear word-like region, not a single letter.
+  if (pairs.length < 10) return null;
+  if (width < height * 2) return null; // not wide enough to be a word
+  if (angleFromVert <= 12.0 || Math.abs(r) <= 0.88) return null;
+
+  // slope = Δcentroid_x / Δrow_y = tan(angle from vertical).
+  // This is exactly what Skia skewX expects — no conversion needed.
+  // Sign: negative slope = forward lean (/), positive = backward lean (\).
+  return slope;
+}
+
+// Boolean wrapper — backward compatible with tests.
+export function estimateItalic(
+  rgbaPixels: Uint8Array,
+  width:      number,
+  height:     number,
+): boolean {
+  return estimateItalicSlant(rgbaPixels, width, height) !== null;
+}
+
 // ── K-Means color sampling ────────────────────────────────────────────────────
 //
 // k=2 clustering on pixel values. Returns the darker cluster centroid as
@@ -415,22 +553,37 @@ function borderMedian(pixels: Uint8Array, width: number, height: number, border 
 // ── Per-region style attributes (computed once per render) ────────────────────
 
 interface RegionStyle {
-  fontClass:   FontClass;
-  weight:      FontWeight;
-  textColor:   ReturnType<typeof Skia.Color>;
-  bgColor:     ReturnType<typeof Skia.Color>;
-  bgAlpha:     number;  // 0–1
+  fontClass:    FontClass;
+  weight:       FontWeight;
+  italicSlant:  number;  // 0 = upright; non-zero = skewX value matching source lean
+  textColor:    ReturnType<typeof Skia.Color>;
+  bgColor:      ReturnType<typeof Skia.Color>;
+  bgAlpha:      number;  // 0–1
 }
 
 const DEFAULT_STYLE: RegionStyle = {
-  fontClass:  'SANS_SERIF',
-  weight:     'REGULAR',
-  textColor:  Skia.Color('#1A1A1A'),
-  bgColor:    Skia.Color('rgba(255,255,255,0.0)'),
-  bgAlpha:    0,
+  fontClass:    'SANS_SERIF',
+  weight:       'REGULAR',
+  italicSlant:  0,
+  textColor:    Skia.Color('#1A1A1A'),
+  bgColor:      Skia.Color('rgba(255,255,255,0.0)'),
+  bgAlpha:      0,
 };
 
 // ── Paragraph builder ─────────────────────────────────────────────────────────
+
+const SYSTEM_FALLBACK_FAMILIES = [
+  'System',
+  'sans-serif',
+  'Noto Sans CJK SC',
+  'Noto Sans CJK TC',
+  'Noto Sans CJK JP',
+  'Noto Sans CJK KR',
+  'PingFang SC',
+  'PingFang TC',
+  'Hiragino Sans',
+  'Apple SD Gothic Neo'
+];
 
 function buildParagraph(
   text:       string,
@@ -441,24 +594,30 @@ function buildParagraph(
   maxHeight:  number,
   rtl:        boolean,
   weight:     FontWeight,
-  fontMgr:    any
+  fontMgr:    any,
+  bestSystemFallback: string
 ) {
   let fontSize = baseFontSize;
   let para: ReturnType<typeof Skia.ParagraphBuilder.Make> | any = null;
 
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 20; i++) {
     const paraStyle = {
       textAlign:     TextAlign.Center,
       textDirection: rtl ? 1 : 0,
-      maxLines:      4,
-      ellipsis:      '…',
     };
 
-    const builder = Skia.ParagraphBuilder.Make(paraStyle, fontMgr);
+    // For CJK languages, use the device system font manager (null) with explicit fallbacks.
+    // Explicitly requesting PingFang/Noto Sans CJK ensures robustness across heavily customized Android ROMs.
+    // We also use this fallback if custom font loading times out.
+    const isSystemFallback = fontName === SYSTEM_FONT || !fontMgr;
+    const activeFontMgr  = isSystemFallback ? Skia.FontMgr.System() : fontMgr;
+    const activeFamilies = isSystemFallback ? [bestSystemFallback, 'sans-serif'] : [fontName, 'NotoSans-Regular'];
+
+    const builder = Skia.ParagraphBuilder.Make(paraStyle, activeFontMgr);
     builder.pushStyle({
       color:        textColor,
       fontSize:     fontSize,
-      fontFamilies: [fontName, 'NotoSans-Regular'],
+      fontFamilies: activeFamilies,
       fontStyle:    {
         weight: weight === 'BOLD' ? 700 : 400,
         width:  5,
@@ -487,7 +646,7 @@ function buildParagraph(
       if (fitsHorizontally && fitsVertically) break;
     }
 
-    if (fontSize <= 8) {
+    if (fontSize <= 1) {
       break;
     }
     fontSize = Math.floor(fontSize * 0.85);
@@ -504,14 +663,9 @@ function useLocalSkImage(uri: string) {
     let active = true;
     if (!uri) return;
 
-    FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 })
-      .then(b64 => {
+    Skia.Data.fromURI(uri)
+      .then(data => {
         if (!active) return;
-        const data = Skia.Data.fromBase64(b64);
-        if (!data) {
-          console.warn(`[SkiaRenderer] Failed to decode base64 for ${uri}`);
-          return;
-        }
         const img = Skia.Image.MakeImageFromEncoded(data);
         if (!img) {
           console.warn(`[SkiaRenderer] Failed to decode image from data for ${uri}`);
@@ -571,7 +725,42 @@ export function TranslatedOverlay({
     'NotoNaskhArabic-Bold':          [require('../../../assets/fonts/NotoNaskhArabic-Bold.ttf')],
     'NotoSansHebrew-Regular':        [require('../../../assets/fonts/NotoSansHebrew-Regular.ttf')],
   });
-  const fontsLoaded = customFonts != null;
+  
+  const [fontsTimeout, setFontsTimeout] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setFontsTimeout(true);
+      // Not a true error: system fonts (e.g. Android's built-in Devanagari/Noto)
+      // will be used as fallback. Only fires when custom fonts take >10s to load.
+      console.log('[SkiaRenderer] Custom fonts not ready after 10s — using system font fallback.');
+    }, 10000);
+    return () => clearTimeout(timer);
+  }, []);
+
+
+  const fontsLoaded = customFonts != null || fontsTimeout;
+
+  // ── Resolve best system CJK fallback ──────────────────────────────────────
+  const bestSystemFallback = useMemo(() => {
+    try {
+      const sysMgr = Skia.FontMgr.System();
+      const count = sysMgr.countFamilies();
+      const available = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        available.add(sysMgr.getFamilyName(i));
+      }
+      
+      for (const family of SYSTEM_FALLBACK_FAMILIES) {
+        if (available.has(family)) {
+          console.log('[SkiaRenderer] Resolved system font fallback:', family);
+          return family;
+        }
+      }
+    } catch (err) {
+      console.warn('[SkiaRenderer] Failed to query system FontMgr:', err);
+    }
+    return 'sans-serif';
+  }, []);
 
   // ── Per-region style extraction — runs once after fonts and images load ───
   // Extracts text color, bg color, font class, and weight from pixel data.
@@ -677,13 +866,20 @@ export function TranslatedOverlay({
           ? estimateWeight(origCrop, cw, ch)
           : 'REGULAR';
 
-        // Text color from original region
-        const [tr, tg, tb] = kMeans2(origCrop, 4);
-        const textColor = Skia.Color(`rgb(${tr},${tg},${tb})`);
+        // Italic: get the actual slope so we can apply the exact same lean angle.
+        // estimateItalicSlant() returns null for upright/handwriting, or the slope
+        // value (= tan(angle) = skewX) for clearly slanted printed text.
+        const italicSlant = estimateItalicSlant(origCrop, cw, ch) ?? 0;
 
-        // Background color from inpainted border
+        // Text color from original region with fallback
+        const [tr, tg, tb] = kMeans2(origCrop, 4);
+        const tColor = Skia.Color(`rgba(${tr||0},${tg||0},${tb||0},1)`);
+        const textColor = tColor || Skia.Color('#1A1A1A');
+
+        // Background color from inpainted border with fallback
         const [br, bg, bb] = borderMedian(inpCrop, icw, ich);
-        const bgColor  = Skia.Color(`rgba(${br},${bg},${bb},0.85)`);
+        const bColor = Skia.Color(`rgba(${br||0},${bg||0},${bb||0},0.85)`);
+        const bgColor  = bColor || Skia.Color('rgba(255,255,255,0.85)');
 
         // Contrast ratio check (simplified WCAG luminance)
         const lum = (r: number, g: number, b: number) => {
@@ -698,7 +894,7 @@ export function TranslatedOverlay({
         // Show bg fill only when contrast is low (< 3:1) — otherwise transparent
         const bgAlpha = contrast < 3.0 ? 0.85 : 0.0;
 
-        return { fontClass, weight, textColor, bgColor, bgAlpha };
+        return { fontClass, weight, italicSlant, textColor, bgColor, bgAlpha };
 
       } catch (e) {
         console.warn('[SkiaRenderer] Style extraction failed for region', ocr.detId, e);
@@ -721,9 +917,20 @@ export function TranslatedOverlay({
       style: regionStyles[i] ?? DEFAULT_STYLE,
     }));
 
-    const eligible = paired.filter(({ ocr, tr }) =>
-      !ocr.skip && tr && tr.engine !== 'failed' && tr.text?.trim()
-    );
+    // Eligible regions: non-skipped OCR results that have either a successful
+    // translation OR the original OCR text as a fallback.
+    // When engine==='failed', we use ocr.text so the user sees the original
+    // text instead of a blank erased region — mirrors PC path (renderer.py).
+    const eligible = paired
+      .filter(({ ocr, tr }) => !ocr.skip && tr)
+      .map(({ ocr, tr, style }) => ({
+        ocr,
+        tr: tr.engine === 'failed'
+          ? { ...tr, text: ocr.text ?? '' }  // fallback to original OCR text
+          : tr,
+        style,
+      }))
+      .filter(({ tr }) => !!tr.text?.trim());
 
     const built = eligible.map(({ ocr, tr, style }) => {
       try {
@@ -739,7 +946,8 @@ export function TranslatedOverlay({
           ocr.bbox.height,
           rtl,
           style.weight,
-          customFonts
+          customFonts,
+          bestSystemFallback
         );
         return { ocr, para, style, ok: true };
       } catch (e) {
@@ -755,7 +963,7 @@ export function TranslatedOverlay({
       renderedCount: built.length,
       totalCount:   eligible.length,
     };
-  }, [ocrResults, translationResults, targetLang, rtl, fontsLoaded, regionStyles]);
+  }, [ocrResults, translationResults, targetLang, rtl, fontsLoaded, regionStyles, bestSystemFallback]);
 
   // ── Fire quality callback once paragraphs are built ───────────────────────
   const onRenderCompleteRef = useRef(onRenderComplete);
@@ -769,12 +977,98 @@ export function TranslatedOverlay({
     }
   }, [fontsLoaded, regionStyles, renderedCount, totalCount]);
 
+  // ── Offscreen snapshot — flatten inpainted image + translated text into JPEG ─
+  //
+  // Runs once after paragraphs are built. Creates a CPU-backed Skia surface at
+  // the original image resolution, draws the inpainted background and all text
+  // paragraphs, encodes to JPEG, writes to cache, then fires onSnapshot(uri).
+  // Errors are caught silently — the live overlay is never affected.
+  const onSnapshotRef = useRef(onSnapshot);
+  useEffect(() => { onSnapshotRef.current = onSnapshot; }, [onSnapshot]);
+
+  const generateSnapshot = useCallback(async () => {
+    if (!onSnapshotRef.current || !inpaintedImage || regions.length === 0) return;
+    try {
+      // Use original image dimensions as canvas size so the saved image is full-res.
+      const srcW = imageWidth  > 1 ? imageWidth  : inpaintedImage.width();
+      const srcH = imageHeight > 1 ? imageHeight : inpaintedImage.height();
+
+      // CPU-backed offscreen surface (safe to call from JS thread).
+      const surface = Skia.Surface.Make(srcW, srcH);
+      if (!surface) {
+        console.warn('[SkiaRenderer] Snapshot: could not create offscreen surface');
+        return;
+      }
+      const canvas = surface.getCanvas();
+
+      // Layer 1: inpainted image scaled to fill the full source resolution.
+      const inpW = inpaintedImage.width();
+      const inpH = inpaintedImage.height();
+      canvas.drawImageRect(
+        inpaintedImage,
+        Skia.XYWHRect(0, 0, inpW, inpH),   // src rect (native inpainted dims)
+        Skia.XYWHRect(0, 0, srcW, srcH),   // dst rect (full original dims)
+        Skia.Paint(),
+      );
+
+      // Layer 2: translated text paragraphs.
+      // OCR bboxes are already in original-image pixel space — no scaling needed.
+      for (const { ocr, para, style } of regions) {
+        const bx = ocr.bbox.x;
+        const by = ocr.bbox.y;
+        const bw = ocr.bbox.width;
+        const bh = ocr.bbox.height;
+
+        // Background fill when contrast is low (mirrors live render logic).
+        if (style.bgAlpha > 0) {
+          const fillPaint = Skia.Paint();
+          fillPaint.setColor(style.bgColor);
+          canvas.drawRRect(
+            Skia.RRectXY(Skia.XYWHRect(bx, by, bw, bh), 2, 2),
+            fillPaint,
+          );
+        }
+
+        // Paragraph — vertically centred inside the bbox (same as live render).
+        const paraY = by + Math.max(0, (bh - para!.getHeight()) / 2);
+        canvas.drawParagraph(para!, bx, paraY);
+      }
+
+      // Encode to JPEG base64 and write to cache.
+      const snapshot = surface.makeImageSnapshot();
+      const base64   = snapshot.encodeToBase64(ImageFormat.JPEG, 92);
+      const uri      = `${FileSystem.cacheDirectory ?? ''}mobile_snapshot_${Date.now()}.jpg`;
+      await FileSystem.writeAsStringAsync(uri, base64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      console.log('[SkiaRenderer] Snapshot saved:', uri);
+      onSnapshotRef.current(uri);
+    } catch (err) {
+      // Never crash the overlay — just log and continue.
+      console.warn('[SkiaRenderer] Snapshot generation failed (overlay still visible):', err);
+    }
+  }, [inpaintedImage, imageWidth, imageHeight, regions]);
+
+  // Trigger snapshot generation once paragraphs are ready.
+  useEffect(() => {
+    if (fontsLoaded && regions.length > 0) {
+      generateSnapshot();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [regions, fontsLoaded]);
+
   const [layout, setLayout] = useState({ width: 0, height: 0 });
 
   return (
     <View
-      style={{ flex: 1, width: '100%' }}
-      onLayout={(e: LayoutChangeEvent) => setLayout(e.nativeEvent.layout)}
+      style={StyleSheet.absoluteFillObject}
+      onLayout={(e: LayoutChangeEvent) => {
+        const { width, height } = e.nativeEvent.layout;
+        if (width > 0 && height > 0) {
+          setLayout({ width, height });
+        }
+      }}
     >
       {!fontsLoaded ? (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
@@ -792,52 +1086,89 @@ export function TranslatedOverlay({
         </View>
       )}
       {layout.width > 0 && layout.height > 0 && inpaintedImage && (() => {
+        // ── Use the actual inpainted pixel dimensions as the canvas coordinate space.
+        // The inpainted image may differ from the original if the backend downscaled it.
+        // OCR bboxes are in original image space → scale them into inpainted space.
+        const inpW = inpaintedImage.width();
+        const inpH = inpaintedImage.height();
+
+        // Guard: if imageWidth/imageHeight are missing (fallback 1), use inpainted dims
+        const srcW = imageWidth  > 1 ? imageWidth  : inpW;
+        const srcH = imageHeight > 1 ? imageHeight : inpH;
+
+        // Scale factors: map OCR pixel coords (original space) → inpainted pixel space
+        const ocrScaleX = inpW / srcW;
+        const ocrScaleY = inpH / srcH;
+
+        // Scale the canvas to fit the view, letterboxed
         const scale = Math.min(
-          layout.width  / imageWidth,
-          layout.height / imageHeight,
+          layout.width  / inpW,
+          layout.height / inpH,
         );
-        const tx = (layout.width  - imageWidth  * scale) / 2;
-        const ty = (layout.height - imageHeight * scale) / 2;
+        const tx = (layout.width  - inpW * scale) / 2;
+        const ty = (layout.height - inpH * scale) / 2;
 
         return (
           <Canvas style={{ width: layout.width, height: layout.height }}>
             <Group transform={[{ translateX: tx }, { translateY: ty }, { scale }]}>
 
-              {/* Layer 1: Inpainted base image */}
+              {/* Layer 1: Inpainted base image at its native pixel dimensions */}
               <Image
                 image={inpaintedImage}
                 x={0}
                 y={0}
-                width={imageWidth}
-                height={imageHeight}
+                width={inpW}
+                height={inpH}
                 fit="fill"
               />
 
               {/* Layer 2: Per-region background fill + translated text overlay */}
-              {regions.map(({ ocr, para, style }, idx) => (
-                <Group key={`region-${ocr.detId}-${idx}`}>
+              {regions.map(({ ocr, para, style }, idx) => {
+                // Map OCR bbox from original-image space to inpainted-image space
+                const bx = ocr.bbox.x      * ocrScaleX;
+                const by = ocr.bbox.y      * ocrScaleY;
+                const bw = ocr.bbox.width  * ocrScaleX;
+                const bh = ocr.bbox.height * ocrScaleY;
 
-                  {/* Background fill — only when contrast is low */}
-                  {style.bgAlpha > 0 && (
-                    <RoundedRect
-                      x={ocr.bbox.x}
-                      y={ocr.bbox.y}
-                      width={ocr.bbox.width}
-                      height={ocr.bbox.height}
-                      r={2}
-                      color={style.bgColor}
-                    />
-                  )}
+                return (
+                  <Group key={`region-${ocr.detId}-${idx}`}>
 
-                  {/* Translated text paragraph (Vertically centered) */}
-                  <Paragraph
-                    paragraph={para!}
-                    x={ocr.bbox.x}
-                    y={ocr.bbox.y + Math.max(0, (ocr.bbox.height - para!.getHeight()) / 2)}
-                    width={ocr.bbox.width}
-                  />
-                </Group>
-              ))}
+                    {/* Background fill — only when contrast is low */}
+                    {style.bgAlpha > 0 && (
+                      <RoundedRect
+                        x={bx}
+                        y={by}
+                        width={bw}
+                        height={bh}
+                        r={2}
+                        color={style.bgColor}
+                      />
+                    )}
+
+                    {/*
+                      * Translated text paragraph (vertically centered).
+                      * If the source text had a measurable italic lean, apply the
+                      * EXACT same slope as a skewX shear anchored at the bbox left
+                      * edge. slope = tan(angle) = skewX directly (no conversion).
+                      * Upright text (italicSlant===0) gets no transform at all.
+                      */}
+                    <Group
+                      transform={style.italicSlant !== 0 ? [
+                        { translateX: bx },
+                        { skewX: style.italicSlant },
+                        { translateX: -bx },
+                      ] : []}
+                    >
+                      <Paragraph
+                        paragraph={para!}
+                        x={bx}
+                        y={by + Math.max(0, (bh - para!.getHeight()) / 2)}
+                        width={bw}
+                      />
+                    </Group>
+                  </Group>
+                );
+              })}
             </Group>
           </Canvas>
         );

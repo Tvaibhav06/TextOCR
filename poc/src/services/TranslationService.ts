@@ -49,6 +49,7 @@ export interface TranslationSession {
   
   /** PC path only: text returned from the server for the testing popup */
   pcTranslatedTexts?: string[];
+  pcSourceLangs?: string[];
 }
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -68,11 +69,11 @@ export class TranslationService {
     result:     PipelineResult,
     targetLang: string,
     onProgress?: (stage: string, detail?: string) => void,
-    forceMode?: 'mobile' | 'pc',
+    preferredPath: 'mobile' | 'pc' = 'mobile',
     existingOcrResults?: any[],
   ): Promise<TranslationSession> {
     const routerResult: TranslationRouterResult = await translationRouter.run(
-      result, targetLang, onProgress, forceMode, existingOcrResults
+      result, targetLang, onProgress, preferredPath, existingOcrResults
     );
 
     // Map router result directly to TranslationSession (same shape)
@@ -88,6 +89,7 @@ export class TranslationService {
       translatedCount: routerResult.translatedCount,
       detectionCount:  routerResult.detectionCount,
       pcTranslatedTexts: routerResult.pcTranslatedTexts,
+      pcSourceLangs: routerResult.pcSourceLangs,
     };
   }
 }

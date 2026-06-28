@@ -367,26 +367,45 @@ class FontAttributeExtractor:
     def _detect_italic(self, crop: np.ndarray,
                        skew_threshold_deg: float = 5.0) -> bool:
         """
-        PCA on foreground pixel coordinates. If the first eigenvector deviates
-        > skew_threshold_deg from vertical, flag italic.
+        Detect italic slant using row-centroid linear regression.
+        Computes the X-centroid for each row, and fits a line.
+        A significant slope indicates italic slant.
         """
+        h, w = crop.shape[:2]
+        if h < 8 or w < 16:
+            return False
+
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
         _, binary = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         if binary.mean() > 200:
             binary = cv2.bitwise_not(binary)
 
-        ys, xs = np.where(binary > 0)
-        if len(xs) < 20:
+        row_counts = np.sum(binary > 0, axis=1)
+        x_indices = np.arange(w)
+        row_sums = np.sum((binary > 0) * x_indices, axis=1)
+
+        min_row_fg = max(1, w // 20)
+        valid = row_counts >= min_row_fg
+        if np.sum(valid) < 4:
             return False
 
-        pts = np.stack([xs, ys], axis=1).astype(np.float32)
-        _, _, vt = np.linalg.svd(pts - pts.mean(axis=0), full_matrices=False)
-        # Principal axis angle from horizontal
-        angle_from_horiz = math.degrees(math.atan2(float(vt[0, 1]),
-                                                    float(vt[0, 0])))
-        # Convert to angle from vertical
-        angle_from_vert = abs(90.0 - abs(angle_from_horiz))
+        y_coords = np.arange(h)[valid]
+        x_centroids = row_sums[valid] / row_counts[valid]
+
+        # Least-squares slope: dx/dy
+        n = len(y_coords)
+        sum_y = np.sum(y_coords)
+        sum_x = np.sum(x_centroids)
+        sum_yy = np.sum(y_coords * y_coords)
+        sum_xy = np.sum(y_coords * x_centroids)
+        
+        denom = n * sum_yy - sum_y * sum_y
+        if abs(denom) < 1e-9:
+            return False
+            
+        slope = (n * sum_xy - sum_y * sum_x) / denom
+        angle_from_vert = abs(math.degrees(math.atan(slope)))
         return angle_from_vert > skew_threshold_deg
 
     # ── Colour extraction ─────────────────────────────────────────────────────
@@ -529,7 +548,14 @@ _FONT_MATRIX: dict[tuple, str] = {
     ("sans_serif", "regular", "arabic"):     "NotoNaskhArabic-Regular.ttf",
     ("sans_serif", "bold",    "arabic"):     "NotoNaskhArabic-Bold.ttf",
     ("sans_serif", "regular", "hebrew"):     "NotoSansHebrew-Regular.ttf",
-    ("sans_serif", "regular", "cjk"):        "NotoSansCJKsc-Regular.otf",
+    # CJK (Simplified Chinese, Traditional Chinese, Japanese) — uses unified TTC
+    # NotoSansCJK-Regular.ttc covers SC/TC/JP/KR. Download via download_fonts.py.
+    ("sans_serif", "regular", "cjk"):        "NotoSansCJK-Regular.ttc",
+    ("sans_serif", "bold",    "cjk"):        "NotoSansCJK-Bold.ttc",
+    ("serif",      "regular", "cjk"):        "NotoSansCJK-Regular.ttc",   # no Serif CJK — use Sans
+    # Hangul (Korean) uses the same CJK TTC but gets its own script key
+    ("sans_serif", "regular", "hangul"):     "NotoSansCJK-Regular.ttc",
+    ("sans_serif", "bold",    "hangul"):     "NotoSansCJK-Bold.ttc",
     # ── SERIF ──────────────────────────────────────────────────────────────────
     ("serif", "regular", "latin"):           "NotoSerif-Regular.ttf",
     ("serif", "thin",    "latin"):           "NotoSerif-Regular.ttf",
@@ -561,7 +587,7 @@ _LANG_TO_SCRIPT: dict[str, str] = {
     "ar": "arabic", "ur": "arabic", "fa": "arabic",
     "ks": "arabic", "sd": "arabic",
     "he": "hebrew",
-    "zh": "cjk", "ja": "cjk", "ko": "cjk",
+    "zh": "cjk", "ja": "cjk", "ko": "hangul",
     "ru": "cyrillic", "uk": "cyrillic", "bg": "cyrillic",
 }
 
@@ -578,12 +604,25 @@ class FontSelector:
 
     def select(self,
                attrs: FontAttrs,
+               text: str,
                target_lang: str) -> Tuple[Path, int]:
         """
         Returns (font_path, fallback_level_used).
         fallback_level: 0 = exact, 1 = script-only, 2 = universal.
         """
-        script = _LANG_TO_SCRIPT.get(target_lang.lower(), "latin")
+        # Determine the primary script of the actual text, falling back to the requested lang
+        actual_script = _detect_script_from_text(text)
+        expected_script = _LANG_TO_SCRIPT.get(target_lang.lower(), "latin")
+        
+        # If the text is Latin (e.g. English fallback) but the target was Indic,
+        # we MUST use Latin to prevent tofu blocks.
+        script = actual_script if actual_script != "latin" else (
+            "latin" if _detect_script_from_text(text) == "latin" and expected_script != "latin" else expected_script
+        )
+        
+        # For pure Latin text, force Latin script selection
+        if actual_script == "latin":
+            script = "latin"
 
         # Level 0: exact match
         key0 = (attrs.font_class.value, attrs.weight.value, script)
@@ -593,7 +632,15 @@ class FontSelector:
             if p.exists():
                 return p, 0
 
-        # Level 1: script-safe default (SANS_SERIF + REGULAR for this script)
+        # Level 1: script-safe default (SANS_SERIF + preserving weight)
+        key1_weight = ("sans_serif", attrs.weight.value, script)
+        fn1_weight = _FONT_MATRIX.get(key1_weight)
+        if fn1_weight:
+            p1_weight = FONTS_DIR / fn1_weight
+            if p1_weight.exists():
+                return p1_weight, 1
+
+        # Level 1.5: script-safe default (SANS_SERIF + REGULAR)
         key1 = ("sans_serif", "regular", script)
         fn1 = _FONT_MATRIX.get(key1)
         if fn1:
@@ -617,6 +664,25 @@ class FontSelector:
 # ════════════════════════════════════════════════════════════════════════════════
 # TEXT RENDERER — uharfbuzz + freetype-py + python-bidi + cv2
 # ════════════════════════════════════════════════════════════════════════════════
+
+# Unicode blocks mapped to our supported script keys
+_SCRIPT_RANGES = {
+    "devanagari": (0x0900, 0x097F),
+    "bengali":    (0x0980, 0x09FF),
+    "gurmukhi":   (0x0A00, 0x0A7F),
+    "gujarati":   (0x0A80, 0x0AFF),
+    "oriya":      (0x0B00, 0x0B7F),
+    "tamil":      (0x0B80, 0x0BFF),
+    "telugu":     (0x0C00, 0x0C7F),
+    "kannada":    (0x0C80, 0x0CFF),
+    "malayalam":  (0x0D00, 0x0D7F),
+    "sinhala":    (0x0D80, 0x0DFF),
+    "arabic":     (0x0600, 0x06FF),
+    "hebrew":     (0x0590, 0x05FF),
+    "cyrillic":   (0x0400, 0x04FF),
+    "cjk":        (0x4E00, 0x9FFF),
+    "hangul":     (0xAC00, 0xD7FF),   # Hangul syllables block
+}
 
 def _detect_script_from_text(text: str) -> str:
     """Detect the primary script of a string from Unicode codepoints."""
@@ -690,6 +756,16 @@ class TextRenderer:
         for ocr, tr in paired:
             # Hard skip: region was explicitly flagged as no-text by OCR
             if ocr.skip:
+                # Draw a subtle 1px border if we have a low_conf_text — visual
+                # indicator that text was detected but not readable.
+                low_conf = getattr(ocr, "low_conf_text", "").strip()
+                if low_conf:
+                    x  = max(0, min(ocr.x, w - 1))
+                    y_ = max(0, min(ocr.y, h - 1))
+                    x2 = max(x + 1, min(ocr.x + ocr.w, w))
+                    y2 = max(y_ + 1, min(ocr.y + ocr.h, h))
+                    cv2.rectangle(output, (x, y_), (x2 - 1, y2 - 1),
+                                  color=(180, 180, 180), thickness=1)
                 log.debug("[Stage 7] Region %d: OCR skip — left erased", ocr.det_id)
                 continue
 
@@ -700,7 +776,16 @@ class TextRenderer:
             if tr.engine == "failed":
                 fallback_text = (ocr.text or "").strip()
                 if not fallback_text:
-                    log.debug("[Stage 7] Region %d: translation failed, no OCR text — left erased", ocr.det_id)
+                    # Draw a 1px dashed border to signal "text was here but
+                    # could not be read or translated" instead of silently blank.
+                    x  = max(0, min(ocr.x, w - 1))
+                    y_ = max(0, min(ocr.y, h - 1))
+                    x2 = max(x + 1, min(ocr.x + ocr.w, w))
+                    y2 = max(y_ + 1, min(ocr.y + ocr.h, h))
+                    cv2.rectangle(output, (x, y_), (x2 - 1, y2 - 1),
+                                  color=(120, 120, 200), thickness=1)
+                    log.debug("[Stage 7] Region %d: translation failed, no OCR text "
+                              "— border drawn", ocr.det_id)
                     continue
                 log.info("[Stage 7] Region %d: translation failed — rendering original text %r",
                          ocr.det_id, fallback_text[:40])
@@ -800,39 +885,51 @@ class TextRenderer:
 
         # ── Select font ───────────────────────────────────────────────────────
         try:
-            font_path, _ = self._selector.select(attrs, target_lang)
+            font_path, _ = self._selector.select(attrs, text, target_lang)
         except FileNotFoundError as exc:
-            log.warning("[Stage 7] Font not found: %s", exc)
-            return canvas
+            log.warning("[Stage 7] Font not found, falling back to cv2: %s", exc)
+            return self._render_cv2_fallback(canvas, text, attrs, bbox)
 
         is_cjk = target_lang.lower() in ("zh", "ja", "ko")
 
-        # ── Step 1: Determine effective font size (Bug R1/R7 fix) ─────────────
-        # Start at attrs.size_px (= bbox_h) and scale down until the unsplit
-        # text fits within bw. This gives the maximum usable size before wrapping.
-        effective_size = max(6, attrs.size_px)
-        for _ in range(5):
+        # ── Step 1 & 2 & 3: Binary search for best effective size ─────────────
+        low = 6
+        high = max(6, attrs.size_px)
+        best_size = low
+        best_lines = []
+
+        for _ in range(8):
+            mid = (low + high) // 2
             try:
-                _, test_pos = self._shape_text(text, font_path, effective_size)
-                adv = sum(p.x_advance for p in test_pos) >> 6
-                if adv <= bw or effective_size <= 6:
-                    break
-                # Scale down with 5% margin to avoid rounding edge cases
-                effective_size = max(6, int(effective_size * bw / adv * 0.95))
+                test_lines = self._wrap_text(text, font_path, mid, bw, is_cjk)
             except Exception:
-                break
+                test_lines = [text]
+            
+            line_height = max(8, int(mid * 1.2))
+            total_h = len(test_lines) * line_height
+            
+            # Verify if longest line fits in width (wrap_text forces long words onto one line)
+            fits_width = True
+            for line in test_lines:
+                try:
+                    _, pos = self._shape_text(line, font_path, mid)
+                    line_w = sum(p.x_advance for p in pos) >> 6
+                    if line_w > bw:
+                        fits_width = False
+                        break
+                except Exception:
+                    pass
 
-        # ── Step 2: Wrap at effective_size ────────────────────────────────────
-        lines = self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+            if total_h <= bh and fits_width:
+                best_size = mid
+                best_lines = test_lines
+                low = mid + 1
+            else:
+                high = mid - 1
 
-        # ── Step 3: Reduce size further if multi-line overflows height (Bug R3) ─
-        line_height = max(8, int(effective_size * 1.2))   # 120% spacing, not 150%
-        total_h = len(lines) * line_height
-        if total_h > bh and effective_size > 6:
-            fit_scale = (bh / total_h) * 0.92
-            effective_size = max(6, int(effective_size * fit_scale))
-            line_height = max(8, int(effective_size * 1.2))
-            lines = self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+        effective_size = best_size
+        lines = best_lines if best_lines else self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+        line_height = max(8, int(effective_size * 1.2))
 
         # ── Step 4: Vertically center text block ──────────────────────────────
         total_h = len(lines) * line_height

@@ -227,16 +227,20 @@ describe('MobileFontClassifier — cropToModelInput', () => {
 
 describe('SkiaRenderer — region filtering logic', () => {
 
-  // Simulate the filter that render_all applies
+  // Simulate the filter that render_all applies (matches updated SkiaRenderer logic)
   function filterRegions(
     ocr: MobileOcrResult[],
     tr:  MobileTranslationResult[],
   ) {
     return ocr
-      .map((o, i) => ({ ocr: o, tr: tr[i] }))
+      .map((o, i) => ({
+        ocr: o,
+        // When failed, substitute the original OCR text (mirrors PC renderer)
+        tr: tr[i]?.engine === 'failed' ? { ...tr[i], text: o.text } : tr[i],
+      }))
       .filter(({ ocr, tr }) => {
         if (ocr.skip) return false;
-        if (!tr || tr.engine === 'failed') return false;
+        if (!tr) return false;
         if (!tr.text?.trim()) return false;
         return true;
       });
@@ -254,10 +258,13 @@ describe('SkiaRenderer — region filtering logic', () => {
     expect(filterRegions(ocr, tr)).toHaveLength(0);
   });
 
-  it('filters out failed translation regions', () => {
-    const ocr = [makeOcrResult(0, false)];
+  it('falls back to OCR text for failed translation regions', () => {
+    const ocr = [makeOcrResult(0, false)]; // ocr.text = 'Hello'
     const tr  = [makeTrResult('', 'failed')];
-    expect(filterRegions(ocr, tr)).toHaveLength(0);
+    const result = filterRegions(ocr, tr);
+    // Should NOT be dropped — should render with OCR fallback text 'Hello'
+    expect(result).toHaveLength(1);
+    expect(result[0].tr.text).toBe('Hello');
   });
 
   it('filters out empty translation text', () => {
@@ -270,5 +277,147 @@ describe('SkiaRenderer — region filtering logic', () => {
     const ocr = [makeOcrResult(0), makeOcrResult(1), makeOcrResult(2, true)];
     const tr  = [makeTrResult('A'), makeTrResult('B'), makeTrResult('C')];
     expect(filterRegions(ocr, tr)).toHaveLength(2);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUITE 4: CJK font sentinel logic
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('SkiaRenderer — CJK font sentinel', () => {
+  // Mirror the getFontAssetName sentinel logic for CJK
+  const SYSTEM_FONT = 'SYSTEM';
+  function fontNameForLang(lang: string): string {
+    const cjk = ['zh', 'ja', 'ko'];
+    if (cjk.includes(lang.toLowerCase())) return SYSTEM_FONT;
+    return 'NotoSans-Regular'; // non-CJK returns a real font name
+  }
+
+  it('returns SYSTEM sentinel for Chinese (zh)', () => {
+    expect(fontNameForLang('zh')).toBe(SYSTEM_FONT);
+  });
+
+  it('returns SYSTEM sentinel for Japanese (ja)', () => {
+    expect(fontNameForLang('ja')).toBe(SYSTEM_FONT);
+  });
+
+  it('returns SYSTEM sentinel for Korean (ko)', () => {
+    expect(fontNameForLang('ko')).toBe(SYSTEM_FONT);
+  });
+
+  it('does NOT return SYSTEM sentinel for Latin (fr)', () => {
+    expect(fontNameForLang('fr')).not.toBe(SYSTEM_FONT);
+  });
+
+  it('does NOT return SYSTEM sentinel for Hindi (hi)', () => {
+    expect(fontNameForLang('hi')).not.toBe(SYSTEM_FONT);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUITE 5: estimateItalic
+// ═══════════════════════════════════════════════════════════════════════════
+// Inline replica of estimateItalic logic (cannot import from SkiaRenderer.tsx
+// directly — it pulls expo-file-system which is ESM-only and fails Jest).
+// The production function is tested via its observable guards.
+
+describe('estimateItalic (guard logic)', () => {
+
+  /**
+   * Inline replica of SkiaRenderer.estimateItalic.
+   * Kept in sync manually; tests the guard behaviour and regression-checks
+   * the slope-detection algorithm without touching the full React component.
+   */
+  function estimateItalic(rgbaPixels: Uint8Array | null, width: number, height: number): boolean {
+    if (!rgbaPixels || width < 16 || height < 8) return false;
+    if (width < height * 1.5) return false;
+    const gray = new Uint8Array(width * height);
+    for (let i = 0; i < width * height; i++) {
+      gray[i] = Math.round(0.299 * rgbaPixels[i*4] + 0.587 * rgbaPixels[i*4+1] + 0.114 * rgbaPixels[i*4+2]);
+    }
+    const hist = new Array(256).fill(0);
+    for (const v of gray) hist[v]++;
+    const total = width * height;
+    let sumAll = 0;
+    for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+    let wB = 0, sumB = 0, maxVar = 0, thr = 128;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t]; if (wB === 0) continue;
+      const wF = total - wB; if (wF === 0) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+      const v = wB * wF * (mB - mF) ** 2;
+      if (v > maxVar) { maxVar = v; thr = t; }
+    }
+    thr = Math.max(1, Math.min(254, thr)); // clamp: thr=0/255 produces degenerate masks
+    const darkCount = gray.filter(v => v < thr).length;
+    const binary = new Uint8Array(total);
+    if (darkCount < total * 0.5) {
+      for (let i = 0; i < total; i++) binary[i] = gray[i] < thr ? 255 : 0;
+    } else {
+      for (let i = 0; i < total; i++) binary[i] = gray[i] >= thr ? 255 : 0;
+    }
+    const fgCount = binary.reduce((s, v) => s + (v > 0 ? 1 : 0), 0);
+    if (fgCount < 50) return false;
+    const rowCount = new Array(height).fill(0);
+    const rowSumX  = new Array(height).fill(0);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (binary[y * width + x] > 0) { rowCount[y]++; rowSumX[y] += x; }
+      }
+    }
+    const minRowFg = Math.max(1, Math.floor(width * 0.05));
+    const pairs: [number, number][] = [];
+    for (let y = 0; y < height; y++) {
+      if (rowCount[y] >= minRowFg) pairs.push([y, rowSumX[y] / rowCount[y]]);
+    }
+    if (pairs.length < 4) return false;
+    let n = pairs.length, sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (const [py, px] of pairs) { sumX += py; sumY += px; sumXY += py*px; sumX2 += py*py; }
+    const denom = n * sumX2 - sumX * sumX;
+    if (Math.abs(denom) < 1e-9) return false;
+    const slope = (n * sumXY - sumX * sumY) / denom;
+    return Math.abs(Math.atan(slope) * 180 / Math.PI) > 5.0;
+  }
+
+  function makeBlankRgba(w: number, h: number): Uint8Array { return new Uint8Array(w * h * 4).fill(255); }
+  function paintRect(buf: Uint8Array, bw: number, x: number, y: number, rw: number, rh: number) {
+    for (let row = y; row < y + rh; row++)
+      for (let col = x; col < x + rw; col++) {
+        const p = (row * bw + col) * 4;
+        buf[p] = buf[p+1] = buf[p+2] = 0; buf[p+3] = 255;
+      }
+  }
+
+  it('returns false for null pixels', () => expect(estimateItalic(null, 100, 40)).toBe(false));
+
+  it('returns false for region too small (width < 16)', () => {
+    expect(estimateItalic(makeBlankRgba(10, 20), 10, 20)).toBe(false);
+  });
+
+  it('returns false for tall region (single char guard: width < height*1.5)', () => {
+    const buf = makeBlankRgba(20, 30);
+    paintRect(buf, 20, 2, 2, 16, 26);
+    expect(estimateItalic(buf, 20, 30)).toBe(false);
+  });
+
+  it('returns false for a straight vertical stroke (upright text)', () => {
+    const w = 100, h = 30;
+    const buf = makeBlankRgba(w, h);
+    paintRect(buf, w, 45, 0, 10, h);  // vertical bar — zero slope
+    expect(estimateItalic(buf, w, h)).toBe(false);
+  });
+
+  it('returns true for a strongly skewed stroke (italic ~56°)', () => {
+    // 160×40 region: paint a thick diagonal band that shifts rightward with row.
+    // Each row gets a 10px-wide, 1px-tall stroke; across 40 rows → 400 fg pixels > 50 threshold.
+    // Centroid shifts 2px per row → ~63° angle from vertical → well above 5° threshold.
+    const w = 160, h = 40;
+    const buf = makeBlankRgba(w, h);
+    for (let row = 0; row < h; row++) {
+      const cx = 10 + Math.round(row * 2.5); // 2.5px/row → ~68° lean
+      paintRect(buf, w, Math.min(cx, w - 12), row, 12, 1);
+    }
+    expect(estimateItalic(buf, w, h)).toBe(true);
   });
 });

@@ -35,3 +35,7 @@ debug.keystore
 .idea/
 *.log
 test_img.jpg
+poc/dummy.jpg
+poc/test_*.py
+*.docx
+phase2 implementation

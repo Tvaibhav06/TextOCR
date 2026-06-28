@@ -129,11 +129,10 @@ export function cleanOcrText(raw: string): string {
   // This means we keep Devanagari, Arabic, Tamil, CJK etc. at boundaries.
   text = text.replace(/^[^\w\u00A0-\uFFFF]+/, '').replace(/[^\w\u00A0-\uFFFF]+$/, '');
 
-  // Remove isolated lone ASCII punctuation tokens (single non-word, non-Unicode char
-  // surrounded by spaces). Does NOT affect lone Indic characters or single letters.
+  // Remove common isolated OCR noise tokens (like isolated punctuation).
   // Example removed: "Hello . World" → "Hello World"
   // Example kept:    "I am here" ("I" is \w)  |  "U.S.A" (no surrounding spaces)
-  text = text.replace(/(?<=\s|^)[^\w\u00A0-\uFFFF](?=\s|$)/g, '');
+  text = text.replace(/(?<=\s|^)[.,\-_|'"~`!;:](?=\s|$)/g, '');
 
   // Collapse spaces again
   text = text.replace(/\s+/g, ' ').trim();

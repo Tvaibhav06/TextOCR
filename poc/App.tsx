@@ -20,6 +20,7 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import * as ImageManipulator from 'expo-image-manipulator';
+import * as FileSystem from 'expo-file-system';
 
 import {
   pipeline,
@@ -73,6 +74,14 @@ interface AppState {
   targetLang: string;
   /** Stage 7 mobile render coverage — set by onRenderComplete callback. */
   renderCoverage: number | null;
+  /**
+   * File URI of the flattened snapshot produced by SkiaRenderer offscreen render.
+   * Non-null only after a successful mobile translation render.
+   * The Save button uses this instead of resultUri on the mobile path so the
+   * saved image actually contains the translated text.
+   */
+  mobileSnapshotUri: string | null;
+  isFullscreenPreview: boolean;
 }
 
 const initialState: AppState = {
@@ -87,6 +96,8 @@ const initialState: AppState = {
   translationStage: '',
   targetLang: 'hi',
   renderCoverage: null,
+  mobileSnapshotUri: null,
+  isFullscreenPreview: false,
 };
 
 export default function App() {
@@ -195,13 +206,13 @@ export default function App() {
     }
   };
 
-  const runTranslation = async (forceMode?: 'mobile' | 'pc') => {
+  const runTranslation = async (preferredPath?: 'mobile' | 'pc') => {
     if (!s.result || s.isTranslating) return;
 
     // Pass existing mobile OCR results if they exist (to bypass PC detection/OCR)
     const existingOcrResults = s.translationSession?.mobileData?.ocrResults;
 
-    setS(prev => ({ ...prev, isTranslating: true, translationStage: 'Starting…', translationSession: null, renderCoverage: null }));
+    setS(prev => ({ ...prev, isTranslating: true, translationStage: 'Starting…', translationSession: null, renderCoverage: null, mobileSnapshotUri: null }));
 
     const onProgress = (stage: string, detail?: string) => {
       setS(prev => ({ ...prev, translationStage: detail ?? stage }));
@@ -213,7 +224,7 @@ export default function App() {
         s.result,
         s.targetLang,
         onProgress,
-        forceMode,
+        preferredPath,
         existingOcrResults,
       );
 
@@ -250,14 +261,31 @@ export default function App() {
   };
 
   const saveResult = async () => {
-    if (!s.resultUri) return;
+    // Priority: flattened mobile snapshot (has text) > resultUri (background or PC-rendered).
+    const uriToSave = s.mobileSnapshotUri ?? s.resultUri;
+    if (!uriToSave) return;
+
     const { status } = await MediaLibrary.requestPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('Permission required', 'Please allow media library access.');
       return;
     }
-    await MediaLibrary.saveToLibraryAsync(s.resultUri);
-    Alert.alert('Saved!', 'Image saved to your photo gallery.');
+
+    // Copy to a fresh temp file first.
+    // MediaLibrary on Android cannot always read files directly from the
+    // app’s internal cacheDirectory, so this copy step is mandatory.
+    const tmpPath = `${FileSystem.cacheDirectory ?? ''}save_${Date.now()}.jpg`;
+    try {
+      await FileSystem.copyAsync({ from: uriToSave, to: tmpPath });
+      await MediaLibrary.saveToLibraryAsync(tmpPath);
+      Alert.alert('Saved!', 'Image saved to your photo gallery.');
+    } catch (err: any) {
+      console.error('[App] saveResult failed:', err);
+      Alert.alert('Save Failed', err?.message ?? 'Could not save image. Please try again.');
+    } finally {
+      // Always clean up the temp file whether save succeeded or failed.
+      FileSystem.deleteAsync(tmpPath, { idempotent: true }).catch(() => {});
+    }
   };
 
   const reset = () => {
@@ -395,28 +423,33 @@ export default function App() {
   const renderResult = () => (
     <View style={styles.resultContainer}>
       {/* Toggle pill — sits right at the top, no floating gap */}
-      <View style={styles.resultToggleRow}>
-        <View style={styles.resultToggle}>
-          <Pressable
-            id="btn-before"
-            style={[styles.toggleBtn, s.showBefore && styles.toggleBtnActive]}
-            onPress={() => setS(prev => ({ ...prev, showBefore: true }))}
-          >
-            <Text style={[styles.toggleBtnText, s.showBefore && styles.toggleBtnTextActive]}>Before</Text>
-          </Pressable>
-          <View style={styles.toggleDivider} />
-          <Pressable
-            id="btn-after"
-            style={[styles.toggleBtn, !s.showBefore && styles.toggleBtnActive]}
-            onPress={() => setS(prev => ({ ...prev, showBefore: false }))}
-          >
-            <Text style={[styles.toggleBtnText, !s.showBefore && styles.toggleBtnTextActive]}>After</Text>
-          </Pressable>
+      {!s.isFullscreenPreview && (
+        <View style={styles.resultToggleRow}>
+          <View style={styles.resultToggle}>
+            <Pressable
+              id="btn-before"
+              style={[styles.toggleBtn, s.showBefore && styles.toggleBtnActive]}
+              onPress={() => setS(prev => ({ ...prev, showBefore: true }))}
+            >
+              <Text style={[styles.toggleBtnText, s.showBefore && styles.toggleBtnTextActive]}>Before</Text>
+            </Pressable>
+            <View style={styles.toggleDivider} />
+            <Pressable
+              id="btn-after"
+              style={[styles.toggleBtn, !s.showBefore && styles.toggleBtnActive]}
+              onPress={() => setS(prev => ({ ...prev, showBefore: false }))}
+            >
+              <Text style={[styles.toggleBtnText, !s.showBefore && styles.toggleBtnTextActive]}>After</Text>
+            </Pressable>
+          </View>
         </View>
-      </View>
+      )}
 
       {/* Image fills all remaining space between toggle and bottom sheet */}
-      <View style={styles.resultImageContainer}>
+      <Pressable 
+        style={styles.resultImageContainer}
+        onPress={() => setS(prev => ({ ...prev, isFullscreenPreview: !prev.isFullscreenPreview }))}
+      >
         {FEATURES.STAGE7_MOBILE_ENABLED
           && s.translationSession?.path === 'mobile'
           && s.translationSession.mobileData
@@ -438,6 +471,13 @@ export default function App() {
                 return { ...prev, renderCoverage: cov };
               });
             }}
+            onSnapshot={(uri) => {
+              console.log('[App] Stage 7 snapshot received:', uri);
+              setS(prev => {
+                if (prev.mobileSnapshotUri === uri) return prev; // idempotent
+                return { ...prev, mobileSnapshotUri: uri };
+              });
+            }}
           />
         ) : (
           // Default: show result image (erase-only, or PC-rendered translation)
@@ -447,26 +487,28 @@ export default function App() {
             resizeMode="contain"
           />
         )}
-      </View>
+      </Pressable>
 
       {/* Bottom sheet — fixed at bottom, never overlaps image */}
-      <ResultBottomSheet
-        result={s.result!}
-        onSave={saveResult}
-        onRetry={reset}
-        onOpenSettings={openSettings}
-        onForceMobile={() => runPipeline('mobile')}
-        onForceServer={() => runPipeline('pc')}
-        onTranslate={() => runTranslation()}
-        onForceTranslateMobile={() => runTranslation('mobile')}
-        onForceTranslateServer={() => runTranslation('pc')}
-        isTranslating={s.isTranslating}
-        translationStage={s.translationStage}
-        targetLang={s.targetLang}
-        onTargetLangChange={(lang) => setS(prev => ({ ...prev, targetLang: lang }))}
-        translationSession={s.translationSession}
-        renderCoverage={s.renderCoverage}
-      />
+      {!s.isFullscreenPreview && (
+        <ResultBottomSheet
+          result={s.result!}
+          onSave={saveResult}
+          onRetry={reset}
+          onOpenSettings={openSettings}
+          onForceMobile={() => runPipeline('mobile')}
+          onForceServer={() => runPipeline('pc')}
+          onTranslate={() => runTranslation()}
+          onForceTranslateMobile={() => runTranslation('mobile')}
+          onForceTranslateServer={() => runTranslation('pc')}
+          isTranslating={s.isTranslating}
+          translationStage={s.translationStage}
+          targetLang={s.targetLang}
+          onTargetLangChange={(lang) => setS(prev => ({ ...prev, targetLang: lang }))}
+          translationSession={s.translationSession}
+          renderCoverage={s.renderCoverage}
+        />
+      )}
     </View>
   );
 

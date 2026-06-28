@@ -136,6 +136,27 @@ class IndicTrans2Engine:
     def _load_model(self, direction: str) -> None:
         if direction in self._models:
             return
+
+        # ── Windows safetensors crash guard ──
+        # Transformers/safetensors panics and silently crashes the process with exit code 1
+        # if the disk is full or there isn't enough space for memory-mapping (pagefile expansion).
+        try:
+            import shutil
+            import os
+            cache_path = os.path.expanduser("~")
+            total, used, free = shutil.disk_usage(cache_path)
+            # Require at least 4GB of free space on the drive to safely load the 1B param model
+            min_required = 4 * 1024 * 1024 * 1024
+            if free < min_required:
+                raise RuntimeError(
+                    f"Insufficient disk space ({free / (1024**3):.2f}GB free). "
+                    f"IndicTrans2 requires at least 4GB of free space on C:\\ to avoid a native crash."
+                )
+        except Exception as disk_e:
+            if isinstance(disk_e, RuntimeError):
+                raise disk_e
+            log.debug("Disk space check failed: %s", disk_e)
+
         model_name = f"ai4bharat/indictrans2-{direction}-1B"
         cache = self._cache_dir()
         log.info("[IndicTrans2] Loading model '%s' (cache: %s) …", model_name, cache)
@@ -196,6 +217,28 @@ class IndicTrans2Engine:
                 ) from exc
             self._ip = IndicProcessor(inference=True)
         return self._ip
+
+    def _models_available(self, direction: str) -> bool:
+        """
+        Fast stat-check: returns True iff the model for `direction` appears to
+        be cached locally WITHOUT loading any weights.
+
+        Checks for the presence of at least one model/config file in the
+        huggingface hub cache directory for the model.
+        """
+        import pathlib
+        model_slug = f"ai4bharat--indictrans2-{direction}-1B"
+        cache_root = pathlib.Path(self._cache_dir())
+        if not cache_root.exists():
+            return False
+        # HF hub stores models as <cache_dir>/models--<org>--<repo>/
+        model_dir = cache_root / f"models--{model_slug.replace('--', '--', 1)}"
+        # Also try the simpler layout: cache_dir/ai4bharat/indictrans2-*
+        alt_dir = cache_root / "ai4bharat" / f"indictrans2-{direction}-1B"
+        for candidate in (model_dir, alt_dir):
+            if candidate.exists() and any(candidate.rglob("config.json")):
+                return True
+        return False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -344,7 +387,34 @@ class TranslationRouter:
         self._indic = IndicTrans2Engine()
         self._argos = ArgosEngine()
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────────────────────
+
+    def indictrans2_status(self) -> dict:
+        """
+        Returns per-direction availability of IndicTrans2 model files.
+        Does NOT load any weights — suitable for health checks and startup logging.
+
+        Returns:
+            dict mapping direction string → bool:
+              { 'en-indic': True, 'indic-en': False, 'indic-indic': False }
+        """
+        directions = ["en-indic", "indic-en", "indic-indic"]
+        return {d: self._indic._models_available(d) for d in directions}
+
+    def preflight(self, src: str, tgt: str) -> None:
+        """
+        Log availability warnings for a given src→tgt language pair.
+        Call once at the start of a request to surface actionable warnings
+        without blocking the request.
+        """
+        if _use_indic_engine(src, tgt):
+            direction = self._indic._direction(src, tgt)
+            if not self._indic._models_available(direction):
+                log.warning(
+                    "[Router] IndicTrans2 direction '%s' not cached —"
+                    " %s→%s will use Argos fallback.",
+                    direction, src, tgt,
+                )
 
     def translate(self,
                   text: str,
@@ -367,10 +437,14 @@ class TranslationRouter:
             src = self._identify_language(text)
 
         if src.lower() == "und":
-            return TranslationResult(text=text, engine="passthrough",
-                                     src_lang=src, tgt_lang=tgt)
+            # Best-effort: treat as English for Latin text rather than silently
+            # passing through. If Argos en→tgt pair is unavailable it will
+            # fall back to engine='failed', but at least we TRY.
+            log.debug("[Router] src='und' — treating as 'en' for best-effort translation.")
+            src = "en"
 
-        if src.lower() == tgt.lower():
+        # Same-language guard: only passthrough when src is a real known code.
+        if src.lower() == tgt.lower() and src.lower() not in ("und", "auto"):
             # No translation needed — same language
             return TranslationResult(text=text, engine="passthrough",
                                      src_lang=src, tgt_lang=tgt)

@@ -56,6 +56,22 @@ export function ResultBottomSheet({
 
   const { quality, backend, timing, detections } = result;
 
+  const srcLangs = new Set<string>();
+  if (translationSession?.path === 'mobile' && translationSession.mobileData?.translationResults) {
+    translationSession.mobileData.translationResults.forEach(r => {
+      if (r.srcLang && r.srcLang !== 'und' && r.srcLang !== 'auto') {
+        const name = AVAILABLE_LANGUAGES.find(l => l.code === r.srcLang)?.name || r.srcLang;
+        srcLangs.add(name);
+      }
+    });
+  } else if (translationSession?.path === 'pc' && translationSession.pcSourceLangs) {
+    translationSession.pcSourceLangs.forEach(langCode => {
+      const name = AVAILABLE_LANGUAGES.find(l => l.code === langCode)?.name || langCode;
+      srcLangs.add(name);
+    });
+  }
+  const srcLangsArray = Array.from(srcLangs);
+
   return (
     <View style={styles.sheet}>
       <View style={styles.dragHandle} />
@@ -117,6 +133,13 @@ export function ResultBottomSheet({
           ) : null}
         </View>
       )}
+      {!isTranslating && (translationSession?.path === 'mobile' || translationSession?.path === 'pc') && srcLangsArray.length > 0 && (
+        <View style={styles.sourceLangContainer}>
+          <Text style={styles.sourceLangText}>
+            Source language{srcLangsArray.length > 1 ? 's' : ''} detected as {srcLangsArray.join(', ')}
+          </Text>
+        </View>
+      )}
       {!isTranslating && translationSession?.path === 'failed' && (
         <View style={styles.bannerTranslateFail}>
           <Text style={styles.bannerTitle}>❌ Translation Failed</Text>
@@ -156,9 +179,9 @@ export function ResultBottomSheet({
       )}
 
       {/* Actions */}
-      <View style={styles.actionRow}>
+      <View style={styles.actionColumn}>
         {FEATURES.TRANSLATION_ENABLED && onTranslate && targetLang && onTargetLangChange && (
-          <>
+          <View style={styles.actionRow}>
             <Pressable 
               style={styles.langSelectorBtn} 
               onPress={() => setShowLangPicker(true)}
@@ -174,10 +197,12 @@ export function ResultBottomSheet({
               onPress={onTranslate} 
               primary 
             />
-          </>
+          </View>
         )}
-        <ActionButton id="btn-save" icon="💾" label="Save" onPress={onSave} primary={!FEATURES.TRANSLATION_ENABLED} />
-        <ActionButton id="btn-retry" icon="✕" label="Close" onPress={onRetry} />
+        <View style={styles.actionRow}>
+          <ActionButton id="btn-save" icon="💾" label="Save" onPress={onSave} primary={!FEATURES.TRANSLATION_ENABLED} />
+          <ActionButton id="btn-retry" icon="✕" label="Close" onPress={onRetry} />
+        </View>
       </View>
 
       {/* Language Picker Modal */}
@@ -239,22 +264,22 @@ export function ResultBottomSheet({
       {FEATURES.TRANSLATION_ENABLED && translationSession && (
         <View style={styles.overrideRow}>
           {translationSession.path === 'pc' ? (
-            // Result came from PC server → offer mobile re-run
+            // Result came from PC server → offer to prefer mobile
             <Pressable
               id="btn-force-translate-mobile"
               style={styles.overrideBtn}
               onPress={onForceTranslateMobile}
             >
-              <Text style={styles.overrideBtnText}>📱 Translate Locally (Mobile)</Text>
+              <Text style={styles.overrideBtnText}>📱 Prefer Mobile Translation</Text>
             </Pressable>
           ) : (
-            // Result came from mobile → offer PC server re-run
+            // Result came from mobile → offer to prefer PC server
             <Pressable
               id="btn-force-translate-server"
               style={styles.overrideBtn}
               onPress={onForceTranslateServer}
             >
-              <Text style={styles.overrideBtnText}>⚡ Translate on Server (PC)</Text>
+              <Text style={styles.overrideBtnText}>⚡ Prefer PC Translation</Text>
             </Pressable>
           )}
         </View>
@@ -336,6 +361,9 @@ const styles = StyleSheet.create({
     ...Theme.typography.bodySecondary,
     fontSize: 13,
   },
+  actionColumn: {
+    gap: Theme.spacing.md,
+  },
   actionRow: {
     flexDirection: 'row',
     gap: Theme.spacing.md,
@@ -389,10 +417,11 @@ const styles = StyleSheet.create({
   langSelectorBtn: {
     backgroundColor: Theme.colors.surfaceAlt,
     paddingHorizontal: Theme.spacing.md,
-    paddingVertical: Theme.spacing.sm,
-    borderRadius: Theme.radius.sm,
-    marginRight: Theme.spacing.sm,
+    paddingVertical: 14,
+    borderRadius: Theme.radius.round,
     justifyContent: 'center',
+    alignItems: 'center',
+    flex: 1,
   },
   langSelectorText: {
     ...Theme.typography.button,
@@ -483,6 +512,16 @@ const styles = StyleSheet.create({
     marginBottom: Theme.spacing.sm,
     borderLeftWidth: 3,
     borderLeftColor: Theme.colors.warning,
+  },
+  sourceLangContainer: {
+    marginTop: -Theme.spacing.xs,
+    marginBottom: Theme.spacing.sm,
+    paddingHorizontal: Theme.spacing.sm,
+  },
+  sourceLangText: {
+    ...Theme.typography.caption,
+    color: Theme.colors.textSecondary,
+    fontStyle: 'italic',
   },
 });
 
