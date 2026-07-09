@@ -39,7 +39,7 @@ export interface PipelineInput {
   imageHeight: number;
   confidenceThreshold?: number;   // default 0.50
   dilationPx?: number;   // default 3
-  inpaintMethod?: 'telea' | 'ns' | 'pconv';
+  inpaintMethod?: 'telea' | 'ns';
   enablePoisson?: boolean;
   poissonIterations?: number;
   /**
@@ -110,7 +110,7 @@ export class TextRemovalPipeline {
   async warmUp(): Promise<void> {
     if (this._isWarmedUp) return;
     await Promise.all([
-      textDetector.warmUp({ enableEastFallback: true }),
+      textDetector.warmUp(),
       inpainter.warmUp(),
     ]);
     this._isWarmedUp = true;
@@ -184,12 +184,12 @@ export class TextRemovalPipeline {
     try {
       const inpaintResult = await inpainter.inpaint(input.imageUri, mask, {
         method: input.inpaintMethod ?? 'telea',
-        pconvCoverageThreshold: 0.15,
       });
       inpaintedUri = inpaintResult.outputUri;
       inpaintMethod = inpaintResult.method;
       report('inpainting', performance.now() - ts, true, `method=${inpaintMethod}`);
       console.log(`[Pipeline] Stage 3 ✓ — inpaint(${inpaintMethod}) in ${Math.round(performance.now() - ts)}ms`);
+
     } catch (err: any) {
       report('inpainting', performance.now() - ts, false, err.message);
       throw new Error(`Inpainting failed: ${err.message}`);

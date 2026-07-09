@@ -38,10 +38,12 @@ export interface TranslationSession {
   mobileData: {
     ocrResults:         MobileOcrResult[];
     translationResults: MobileTranslationResult[];
-    fontClasses:        string[];
+    /** @deprecated SkiaRenderer classifies fonts per-region; this field is unused. */
+    fontClasses?:       string[];
     imageWidth:         number;
     imageHeight:        number;
   } | null;
+
 
   totalMs:         number;
   translatedCount: number;

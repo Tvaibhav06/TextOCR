@@ -56,6 +56,7 @@ class OcrResult:
     low_conf_text: str = ""  # Non-empty when conf in [LOW_CONF_FLOOR, MIN_CONFIDENCE).
                              # Stage 7 uses this to draw a border fallback instead of
                              # leaving a fully blank hole.
+    points:        List[Tuple[float, float]] = field(default_factory=list) # polygon points
 
 
 # ── Helper: crop + deskew a polygon region ────────────────────────────────────
@@ -228,6 +229,7 @@ class RegionOCR:
                 w=det.bbox.w,
                 h=det.bbox.h,
                 low_conf_text=low_conf_text,
+                points=det.polygon.tolist(),
             ))
 
             if skip:

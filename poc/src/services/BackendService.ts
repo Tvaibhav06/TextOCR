@@ -19,12 +19,14 @@
 import { Platform } from 'react-native';
 import { MMKV } from 'react-native-mmkv';
 import * as ImageManipulator from 'expo-image-manipulator';
+import * as FileSystem from 'expo-file-system';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MMKV_KEY_BACKEND_URL    = 'backend_url_v2';
 const MMKV_KEY_MANUAL_URL     = 'backend_url_manual_v2';
 const EMULATOR_URL             = 'http://10.0.2.2:8000';
+const ADB_REVERSE_URL          = 'http://127.0.0.1:8000';
 const DEFAULT_PORT             = 8000;
 const HEALTH_PATH              = '/api/health';
 const HEALTH_TIMEOUT_MS        = 3000;   // short — fail fast, don't freeze UI
@@ -157,13 +159,15 @@ class BackendService {
 
   /**
    * Save a manual URL from the Settings screen.
-   * Immediately marks it as the resolved URL too.
+   * Only writes to MMKV_KEY_MANUAL_URL — MMKV_KEY_BACKEND_URL is updated
+   * by resolveUrl() only after a successful health-check probe, so a stale
+   * manual URL doesn’t cause double failed probes (F-2).
    */
   setManualUrl(url: string): void {
     const normalized = url.trim().replace(/\/$/, '');
     storage.set(MMKV_KEY_MANUAL_URL, normalized);
-    // Also update the cached working URL
-    storage.set(MMKV_KEY_BACKEND_URL, normalized);
+    // Do NOT also write MMKV_KEY_BACKEND_URL here; let resolveUrl() do that
+    // after confirming the URL is reachable, to avoid double-probe on stale URLs.
     this._resolvedUrl = normalized;
     console.log('[BackendService] Manual URL saved:', normalized);
   }
@@ -225,8 +229,13 @@ class BackendService {
       console.log('[BackendService] Cached URL not responding.');
     }
 
-    // ── Priority 3: Android emulator shortcut ─────────────────────────────────
+    // ── Priority 3: Android emulator & ADB reverse shortcuts ──────────────────
     if (Platform.OS === 'android') {
+      console.log('[BackendService] Trying ADB reverse URL:', ADB_REVERSE_URL);
+      if (await probeHealth(ADB_REVERSE_URL)) {
+        this._saveWorkingUrl(ADB_REVERSE_URL);
+        return ADB_REVERSE_URL;
+      }
       console.log('[BackendService] Trying emulator URL:', EMULATOR_URL);
       if (await probeHealth(EMULATOR_URL)) {
         this._saveWorkingUrl(EMULATOR_URL);
@@ -486,13 +495,18 @@ class BackendService {
       }
 
       // Save base64 image to cache as a JPEG file
-      const FileSystem = await import('expo-file-system').catch(() => null);
       if (!FileSystem) {
         console.warn('[BackendService] expo-file-system not available.');
         return null;
       }
       const filename  = `translate_result_${Date.now()}.jpg`;
-      const cacheDir  = FileSystem.cacheDirectory ?? 'file:///data/data/com.textremover/cache/';
+      // S-4: FileSystem.cacheDirectory is always defined in Expo SDK 49+;
+      // the fallback is purely defensive. Use a platform-appropriate path
+      // instead of the old Android-only hardcoded path.
+      const cacheDir  = FileSystem.cacheDirectory
+        ?? (Platform.OS === 'ios'
+          ? 'file:///var/mobile/Containers/Data/Application/Unknown/Library/Caches/'
+          : 'file:///data/data/com.textremover/cache/');
       const resultUri = cacheDir + filename;
       await FileSystem.writeAsStringAsync(resultUri, image_b64, {
         encoding: FileSystem.EncodingType.Base64,
@@ -519,8 +533,6 @@ class BackendService {
    */
   private async _saveBlobToCache(blob: Blob): Promise<string | null> {
     try {
-      // Dynamic import — expo-file-system may not be installed in all builds
-      const FileSystem = await import('expo-file-system').catch(() => null);
       if (!FileSystem) {
         console.warn('[BackendService] expo-file-system not available.');
         return null;

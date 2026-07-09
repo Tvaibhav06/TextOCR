@@ -75,7 +75,8 @@ export interface TranslationRouterResult {
   mobileData: {
     ocrResults:         MobileOcrResult[];
     translationResults: MobileTranslationResult[];
-    fontClasses:        string[];
+    /** @deprecated SkiaRenderer classifies fonts per-region; this field is unused. */
+    fontClasses?:       string[];
     imageWidth:         number;
     imageHeight:        number;
   } | null;
@@ -192,7 +193,8 @@ export class TranslationRouter {
       );
     } catch (e: any) {
       console.warn('[TranslationRouter] Mobile OCR exception:', e);
-      this._lastFallbackReason = 'mobile_translate_error';
+      // F-3: Use distinct error code for OCR failures vs. translation failures
+      this._lastFallbackReason = 'mlkit_ocr_error';
       this._lastFallbackDetail = `OCR failed: ${e?.message ?? e}`;
       return null;
     }
@@ -224,7 +226,8 @@ export class TranslationRouter {
       translationResults = await mobileTranslator.translateAll(ocrResults, 'auto', targetLang);
     } catch (e: any) {
       console.warn('[TranslationRouter] Mobile translation exception:', e);
-      this._lastFallbackReason = 'mobile_translate_error';
+      // F-3: Use distinct error code for translation failures vs. OCR failures
+      this._lastFallbackReason = 'mlkit_translate_error';
       this._lastFallbackDetail = `Translation failed: ${e?.message ?? e}`;
       return null;
     }
@@ -245,7 +248,8 @@ export class TranslationRouter {
 
     // ── Mobile path SUCCESS ──────────────────────────────────────────────────
     // Stage 7 (SkiaRenderer) runs in the UI — we return the data it needs.
-    const fontClasses = ocrResults.map(() => 'SANS_SERIF');
+    // fontClasses is intentionally omitted: SkiaRenderer classifies fonts
+    // per-region itself; a hardcoded 'SANS_SERIF' array adds no value.
 
     console.log(`[TranslationRouter] Mobile path SUCCESS: ${successCount}/${eligibleCount} regions in ${Date.now() - t0}ms`);
     onProgress?.('mobile_done', `Translated ${successCount} region${successCount !== 1 ? 's' : ''} on device`);
@@ -258,7 +262,6 @@ export class TranslationRouter {
       mobileData: {
         ocrResults,
         translationResults,
-        fontClasses,
         imageWidth:  imgW,
         imageHeight: imgH,
       },

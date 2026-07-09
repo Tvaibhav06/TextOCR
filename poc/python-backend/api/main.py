@@ -436,10 +436,7 @@ def process_image(image: UploadFile = File(...)):
         "X-InpaintTier":   result.timing.get("inpaint_tier", "unknown"),
         "X-TotalMs":       str(elapsed_ms),
         "X-Detections":    str(len(result.detections)),
-        # Allow mobile to read these headers cross-origin
-        "Access-Control-Expose-Headers": (
-            "X-SSIM, X-PSNR, X-Coverage, X-InpaintTier, X-TotalMs, X-Detections"
-        ),
+        # Note: Access-Control-Expose-Headers is handled globally by CORSMiddleware
     }
 
     return StreamingResponse(

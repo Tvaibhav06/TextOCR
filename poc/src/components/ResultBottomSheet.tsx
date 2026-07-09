@@ -32,6 +32,12 @@ interface ResultBottomSheetProps {
   translationSession?: TranslationSession | null;
   /** Stage 7 mobile render coverage: 0–1. null = not yet rendered. */
   renderCoverage?: number | null;
+  /**
+   * S-1: When false (mobile path, snapshot not yet ready), the Save button is
+   * disabled and shows "Rendering…" so users cannot accidentally save the
+   * background-only image before translated text has been flattened.
+   */
+  isSaveReady?: boolean;
 }
 
 export function ResultBottomSheet({ 
@@ -50,6 +56,7 @@ export function ResultBottomSheet({
   onTargetLangChange,
   translationSession,
   renderCoverage,
+  isSaveReady = true,
 }: ResultBottomSheetProps) {
   const [showTimings, setShowTimings] = useState(false);
   const [showLangPicker, setShowLangPicker] = useState(false);
@@ -200,7 +207,14 @@ export function ResultBottomSheet({
           </View>
         )}
         <View style={styles.actionRow}>
-          <ActionButton id="btn-save" icon="💾" label="Save" onPress={onSave} primary={!FEATURES.TRANSLATION_ENABLED} />
+          <ActionButton
+            id="btn-save"
+            icon={isSaveReady ? '💾' : '⏳'}
+            label={isSaveReady ? 'Save' : 'Rendering…'}
+            onPress={onSave}
+            primary={!FEATURES.TRANSLATION_ENABLED}
+            disabled={!isSaveReady}
+          />
           <ActionButton id="btn-retry" icon="✕" label="Close" onPress={onRetry} />
         </View>
       </View>

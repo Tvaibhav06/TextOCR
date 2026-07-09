@@ -9,18 +9,21 @@ interface ActionButtonProps {
   onPress: () => void;
   primary?: boolean;
   isCircular?: boolean;
+  /** When true, the button is visually dimmed and onPress is suppressed. */
+  disabled?: boolean;
 }
 
-export function ActionButton({ id, icon, label, onPress, primary, isCircular }: ActionButtonProps) {
+export function ActionButton({ id, icon, label, onPress, primary, isCircular, disabled }: ActionButtonProps) {
   return (
     <Pressable
       id={id}
-      onPress={onPress}
+      onPress={disabled ? undefined : onPress}
       style={({ pressed }) => [
         styles.btn,
         primary ? styles.btnPrimary : styles.btnSecondary,
         isCircular ? styles.btnCircular : styles.btnPill,
-        pressed && styles.btnPressed,
+        pressed && !disabled && styles.btnPressed,
+        disabled && styles.btnDisabled,
       ]}
     >
       <Text style={[styles.icon, primary && styles.iconPrimary, isCircular && styles.iconCircular]}>{icon}</Text>
@@ -86,6 +89,9 @@ const styles = StyleSheet.create({
   btnPressed: {
     opacity: 0.85,
     transform: [{ scale: 0.98 }],
+  },
+  btnDisabled: {
+    opacity: 0.45,
   },
   icon: {
     fontSize: 20,

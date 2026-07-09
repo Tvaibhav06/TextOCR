@@ -534,7 +534,7 @@ _FONT_MATRIX: dict[tuple, str] = {
     ("sans_serif", "thin",    "devanagari"): "NotoSansDevanagari-Regular.ttf",
     ("sans_serif", "bold",    "devanagari"): "NotoSansDevanagari-Bold.ttf",
     ("sans_serif", "regular", "bengali"):    "NotoSansBengali-Regular.ttf",
-    ("sans_serif", "bold",    "bengali"):    "NotoSansBengali-Bold.ttf",
+    ("sans_serif", "bold",    "bengali"):    "NotoSansBengali-Regular.ttf",  # Bold not yet bundled — falls back to Regular
     ("sans_serif", "regular", "tamil"):      "NotoSansTamil-Regular.ttf",
     ("sans_serif", "bold",    "tamil"):      "NotoSansTamil-Regular.ttf",
     ("sans_serif", "regular", "telugu"):     "NotoSansTelugu-Regular.ttf",
@@ -611,18 +611,11 @@ class FontSelector:
         fallback_level: 0 = exact, 1 = script-only, 2 = universal.
         """
         # Determine the primary script of the actual text, falling back to the requested lang
-        actual_script = _detect_script_from_text(text)
+        actual_script   = _detect_script_from_text(text)
         expected_script = _LANG_TO_SCRIPT.get(target_lang.lower(), "latin")
-        
-        # If the text is Latin (e.g. English fallback) but the target was Indic,
-        # we MUST use Latin to prevent tofu blocks.
-        script = actual_script if actual_script != "latin" else (
-            "latin" if _detect_script_from_text(text) == "latin" and expected_script != "latin" else expected_script
-        )
-        
-        # For pure Latin text, force Latin script selection
-        if actual_script == "latin":
-            script = "latin"
+        # If the translated text is Latin (e.g. romanised fallback from bad OCR), use Latin font
+        # to avoid tofu. Otherwise, use the expected target script.
+        script = "latin" if actual_script == "latin" else expected_script
 
         # Level 0: exact match
         key0 = (attrs.font_class.value, attrs.weight.value, script)
@@ -652,7 +645,11 @@ class FontSelector:
         # Level 2: universal fallback
         universal = FONTS_DIR / "NotoSans-Regular.ttf"
         if universal.exists():
-            log.warning("FontSelector L2 fallback to NotoSans-Regular (wanted %s)", key0)
+            log.error(
+                "FontSelector: no script-specific font for lang=%r script=%r — "
+                "run python scripts/download_fonts.py to fix tofu rendering.",
+                target_lang, script,
+            )
             return universal, 2
 
         raise FileNotFoundError(
@@ -771,25 +768,10 @@ class TextRenderer:
 
             # Choose render text:
             #   • Translated text when translation succeeded
-            #   • Original OCR text as graceful fallback when translation failed
-            #     (gives useful output rather than a blank inpainted region)
-            if tr.engine == "failed":
-                fallback_text = (ocr.text or "").strip()
-                if not fallback_text:
-                    # Draw a 1px dashed border to signal "text was here but
-                    # could not be read or translated" instead of silently blank.
-                    x  = max(0, min(ocr.x, w - 1))
-                    y_ = max(0, min(ocr.y, h - 1))
-                    x2 = max(x + 1, min(ocr.x + ocr.w, w))
-                    y2 = max(y_ + 1, min(ocr.y + ocr.h, h))
-                    cv2.rectangle(output, (x, y_), (x2 - 1, y2 - 1),
-                                  color=(120, 120, 200), thickness=1)
-                    log.debug("[Stage 7] Region %d: translation failed, no OCR text "
-                              "— border drawn", ocr.det_id)
-                    continue
-                log.info("[Stage 7] Region %d: translation failed — rendering original text %r",
-                         ocr.det_id, fallback_text[:40])
-                render_text = fallback_text
+            #   • If translation failed, leave region erased instead of rendering original text.
+            if getattr(tr, "failed", False) or tr.engine == "failed":
+                log.info("[Stage 7] Region %d: translation failed — leaving region erased", ocr.det_id)
+                continue
             else:
                 render_text = (tr.text or "").strip()
 
@@ -815,6 +797,7 @@ class TextRenderer:
                     output, render_text, attrs,
                     target_lang=target_lang,
                     bbox=(x, y, x2 - x, y2 - y),
+                    points=getattr(ocr, "points", None),
                 )
             except Exception as exc:
                 log.error("[Stage 7] Region %d render failed: %s", ocr.det_id, exc)
@@ -879,9 +862,23 @@ class TextRenderer:
                        text:        str,
                        attrs:       FontAttrs,
                        target_lang: str,
-                       bbox:        Tuple[int, int, int, int]) -> np.ndarray:
+                       bbox:        Tuple[int, int, int, int],
+                       points:      Optional[List[Tuple[float, float]]] = None) -> np.ndarray:
         """Render a single translated text region onto the canvas."""
         x, y, bw, bh = bbox
+        
+        # If points are provided, we compute the unrotated dimension for the text layer
+        # so HarfBuzz shapes it linearly, then we warp it back.
+        if points and len(points) == 4:
+            pts = np.array(points, dtype=np.float32)
+            wA = np.linalg.norm(pts[1] - pts[0])
+            wB = np.linalg.norm(pts[2] - pts[3])
+            layer_w = max(int(wA), int(wB), 1)
+            hA = np.linalg.norm(pts[2] - pts[1])
+            hB = np.linalg.norm(pts[3] - pts[0])
+            layer_h = max(int(hA), int(hB), 1)
+        else:
+            layer_w, layer_h = bw, bh
 
         # ── Select font ───────────────────────────────────────────────────────
         try:
@@ -901,7 +898,7 @@ class TextRenderer:
         for _ in range(8):
             mid = (low + high) // 2
             try:
-                test_lines = self._wrap_text(text, font_path, mid, bw, is_cjk)
+                test_lines = self._wrap_text(text, font_path, mid, layer_w, is_cjk)
             except Exception:
                 test_lines = [text]
             
@@ -914,13 +911,13 @@ class TextRenderer:
                 try:
                     _, pos = self._shape_text(line, font_path, mid)
                     line_w = sum(p.x_advance for p in pos) >> 6
-                    if line_w > bw:
+                    if line_w > layer_w:
                         fits_width = False
                         break
                 except Exception:
                     pass
 
-            if total_h <= bh and fits_width:
+            if total_h <= layer_h and fits_width:
                 best_size = mid
                 best_lines = test_lines
                 low = mid + 1
@@ -928,15 +925,15 @@ class TextRenderer:
                 high = mid - 1
 
         effective_size = best_size
-        lines = best_lines if best_lines else self._wrap_text(text, font_path, effective_size, bw, is_cjk)
+        lines = best_lines if best_lines else self._wrap_text(text, font_path, effective_size, layer_w, is_cjk)
         line_height = max(8, int(effective_size * 1.2))
 
         # ── Step 4: Vertically center text block ──────────────────────────────
         total_h = len(lines) * line_height
-        start_y = max(0, (bh - total_h) // 2)
+        start_y = max(0, (layer_h - total_h) // 2)
 
         # ── Step 5: Build BGRA text layer ─────────────────────────────────────
-        text_layer = np.zeros((bh, bw, 4), dtype=np.uint8)
+        text_layer = np.zeros((layer_h, layer_w, 4), dtype=np.uint8)
 
         # Copy attrs with the computed effective_size for correct glyph metrics
         eff_attrs = FontAttrs(
@@ -952,8 +949,8 @@ class TextRenderer:
 
         for i, line_text in enumerate(lines):
             ly0 = start_y + i * line_height
-            ly1 = min(bh, ly0 + line_height)
-            if ly0 >= bh or ly1 <= 0:
+            ly1 = min(layer_h, ly0 + line_height)
+            if ly0 >= layer_h or ly1 <= 0:
                 break
             slot_h = ly1 - ly0
 
@@ -970,6 +967,11 @@ class TextRenderer:
             try:
                 glyphs, positions = self._shape_text(
                     display_text, font_path, effective_size)
+                    
+                # Check for Tofu (.notdef) glyphs
+                if any(g.codepoint == 0 for g in glyphs):
+                    log.warning("[Stage 7] Font %s missing glyphs for %s; Tofu boxes detected.", font_path.name, target_lang)
+
             except Exception as exc:
                 log.warning("[Stage 7] HarfBuzz shaping failed: %s", exc)
                 glyphs, positions = None, None
@@ -977,24 +979,24 @@ class TextRenderer:
             # ── Rasterize into a slot_h-tall canvas (Bug R5 fix) ──────────────
             if glyphs is not None:
                 line_layer = self._rasterize_glyphs(
-                    glyphs, positions, font_path, eff_attrs, bw, slot_h)
+                    glyphs, positions, font_path, eff_attrs, layer_w, slot_h)
             else:
                 line_layer = self._cv2_fallback_render(
-                    display_text, eff_attrs, bw, slot_h)
+                    display_text, eff_attrs, layer_w, slot_h)
 
             if line_layer is not None:
                 # ── Porter-Duff "over" composite (Bug R4 fix) ─────────────────
                 # Trust the BGRA from _rasterize_glyphs — no solid-row overwrite
-                src = line_layer[:slot_h, :bw].astype(np.float32)
-                dst = text_layer[ly0:ly1, :bw].astype(np.float32)
+                src = line_layer[:slot_h, :layer_w].astype(np.float32)
+                dst = text_layer[ly0:ly1, :layer_w].astype(np.float32)
                 src_a = src[:, :, 3:4] / 255.0
                 dst_a = dst[:, :, 3:4] / 255.0
                 out_a = src_a + dst_a * (1.0 - src_a)
                 out_a_safe = np.where(out_a > 0, out_a, 1.0)
                 out_rgb = (src[:, :, :3] * src_a +
                            dst[:, :, :3] * dst_a * (1.0 - src_a)) / out_a_safe
-                text_layer[ly0:ly1, :bw, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-                text_layer[ly0:ly1, :bw,  3] = np.clip(
+                text_layer[ly0:ly1, :layer_w, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+                text_layer[ly0:ly1, :layer_w,  3] = np.clip(
                     out_a[:, :, 0] * 255, 0, 255).astype(np.uint8)
 
         # ── Contrast check — add outline if contrast < 3:1 ───────────────────
@@ -1008,6 +1010,26 @@ class TextRenderer:
             outline_layer[:, :, :3] = outline_color
             outline_layer[:, :, 3]  = outline_alpha
             text_layer = self._composite_rgba(text_layer, outline_layer)
+            
+        # ── Warp Perspective back to original polygon if rotated ──────────────
+        if points and len(points) == 4:
+            pts = np.array(points, dtype=np.float32)
+            src_pts = np.array([
+                [0, 0],
+                [layer_w - 1, 0],
+                [layer_w - 1, layer_h - 1],
+                [0, layer_h - 1]
+            ], dtype=np.float32)
+            
+            # Shift pts to be relative to x, y crop
+            pts_shifted = pts - [x, y]
+            
+            M = cv2.getPerspectiveTransform(src_pts, pts_shifted)
+            warped_layer = cv2.warpPerspective(
+                text_layer, M, (bw, bh), 
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT
+            )
+            text_layer = warped_layer
 
         # ── Composite onto canvas using Gamma-correct linear blend ────────────
         cy2 = min(y + bh, canvas.shape[0])

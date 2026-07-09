@@ -49,6 +49,8 @@ export interface MobileOcrResult {
   skipReason?: string;
   /** Pixel-coordinate bbox (mirrors Stage 1 detection) */
   bbox: { x: number; y: number; width: number; height: number };
+  /** Rotation angle in radians calculated from corner points */
+  angle:      number;
 }
 
 interface ImageDimensions {
@@ -325,6 +327,7 @@ export async function extractTextFromRegions(
     let bestRawText     = '';
     let bestMlkitConf   = 0;
     let bestIoU         = 0;
+    let bestAngle       = 0;
 
     for (const block of blocks) {
       const blockFrame = block.frame;
@@ -354,6 +357,12 @@ export async function extractTextFromRegions(
       bestIoU       = overlap;
       bestRawText   = rawBlockText;
       bestMlkitConf = mlkitConf;
+      
+      if (block.cornerPoints && block.cornerPoints.length >= 2) {
+        const p0 = block.cornerPoints[0];
+        const p1 = block.cornerPoints[1];
+        bestAngle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+      }
     }
 
     // ── Clean OCR noise from the best match ──────────────────────────────
@@ -404,6 +413,7 @@ export async function extractTextFromRegions(
         width:  detRect.width,
         height: detRect.height,
       },
+      angle: bestAngle,
     };
   });
 }

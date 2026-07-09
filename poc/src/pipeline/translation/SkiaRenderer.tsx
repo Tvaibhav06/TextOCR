@@ -39,6 +39,8 @@ import {
   useImage,
   Group,
   ColorType,
+  Blur,
+  ClipOp,
 } from '@shopify/react-native-skia';
 import type { MobileOcrResult } from './MobileOCR';
 import type { MobileTranslationResult } from './MobileTranslate';
@@ -586,18 +588,19 @@ const SYSTEM_FALLBACK_FAMILIES = [
 ];
 
 function buildParagraph(
-  text:       string,
-  baseFontSize: number,
-  textColor:  ReturnType<typeof Skia.Color>,
-  fontName:   string,
-  maxWidth:   number,
-  maxHeight:  number,
-  rtl:        boolean,
-  weight:     FontWeight,
-  fontMgr:    any,
+  text: string,
+  textColor: ReturnType<typeof Skia.Color>,
+  fontName: string,
+  maxWidth: number,
+  maxHeight: number,
+  rtl: boolean,
+  weight: FontWeight,
+  customFonts: any,
   bestSystemFallback: string
 ) {
-  let fontSize = baseFontSize;
+  const fontMgr = customFonts;
+  // Start with a large font size and iteratively step down until it fits
+  let fontSize = maxHeight * 1.5;
   let para: ReturnType<typeof Skia.ParagraphBuilder.Make> | any = null;
 
   for (let i = 0; i < 20; i++) {
@@ -646,10 +649,10 @@ function buildParagraph(
       if (fitsHorizontally && fitsVertically) break;
     }
 
-    if (fontSize <= 1) {
+    if (fontSize <= 4) {
       break;
     }
-    fontSize = Math.floor(fontSize * 0.85);
+    fontSize = Math.floor(fontSize * 0.90);
   }
   return para;
 }
@@ -694,6 +697,7 @@ export function TranslatedOverlay({
   translationResults,
   targetLang,
   onRenderComplete,
+  onSnapshot,
 }: SkiaRendererProps): JSX.Element {
   const inpaintedImage = useLocalSkImage(inpaintedUri);
   const originalImage  = useLocalSkImage(originalUri);
@@ -730,12 +734,22 @@ export function TranslatedOverlay({
   useEffect(() => {
     const timer = setTimeout(() => {
       setFontsTimeout(true);
-      // Not a true error: system fonts (e.g. Android's built-in Devanagari/Noto)
-      // will be used as fallback. Only fires when custom fonts take >10s to load.
-      console.log('[SkiaRenderer] Custom fonts not ready after 10s — using system font fallback.');
+      // F-4: Upgrade from silent log to visible error — bundled fonts should
+      // always load; if they don't, the user will see wrong system fonts.
+      console.error(
+        '[SkiaRenderer] Bundled font load timed out after 10s. ' +
+        'Ensure assets/fonts/ fonts are correctly bundled and Metro cache is cleared.'
+      );
+      // F-4: Signal 0/total rendered to onRenderComplete so the partial-render
+      // warning banner fires in the UI, making the failure visible to users.
+      if (onRenderComplete) {
+        // paragraphMap is not yet available here, so fire with 0/0 which
+        // resolves to the same banner (coverage < 0.5).
+        onRenderComplete(0, 0);
+      }
     }, 10000);
     return () => clearTimeout(timer);
-  }, []);
+  }, [onRenderComplete]);
 
 
   const fontsLoaded = customFonts != null || fontsTimeout;
@@ -934,12 +948,10 @@ export function TranslatedOverlay({
 
     const built = eligible.map(({ ocr, tr, style }) => {
       try {
-        const fontSize = estimateFontSize(ocr.bbox.height, targetLang);
         const fontName = getFontAssetName(style.fontClass, style.weight, targetLang);
 
         const para = buildParagraph(
           tr.text,
-          fontSize,
           style.textColor,
           fontName,
           ocr.bbox.width,
@@ -1132,9 +1144,23 @@ export function TranslatedOverlay({
 
                 return (
                   <Group key={`region-${ocr.detId}-${idx}`}>
-
-                    {/* Background fill — only when contrast is low */}
-                    {style.bgAlpha > 0 && (
+                    {/* Blurred background patch from original image for natural blending */}
+                    {style.bgAlpha > 0 && originalImage && (
+                      <Group clip={Skia.RRectXY(Skia.XYWHRect(bx, by, bw, bh), 4, 4)}>
+                        <Image
+                          image={originalImage}
+                          x={0}
+                          y={0}
+                          width={inpW}
+                          height={inpH}
+                          fit="fill"
+                        >
+                          <Blur blur={8} mode="clamp" />
+                        </Image>
+                      </Group>
+                    )}
+                    {/* Fallback to solid rect if original image is missing */}
+                    {style.bgAlpha > 0 && !originalImage && (
                       <RoundedRect
                         x={bx}
                         y={by}
@@ -1145,19 +1171,20 @@ export function TranslatedOverlay({
                       />
                     )}
 
-                    {/*
-                      * Translated text paragraph (vertically centered).
-                      * If the source text had a measurable italic lean, apply the
-                      * EXACT same slope as a skewX shear anchored at the bbox left
-                      * edge. slope = tan(angle) = skewX directly (no conversion).
-                      * Upright text (italicSlant===0) gets no transform at all.
-                      */}
+                    {/* Translated text paragraph (vertically centered & rotated) */}
                     <Group
-                      transform={style.italicSlant !== 0 ? [
-                        { translateX: bx },
-                        { skewX: style.italicSlant },
-                        { translateX: -bx },
-                      ] : []}
+                      transform={[
+                        { translateX: bx + bw / 2 },
+                        { translateY: by + bh / 2 },
+                        { rotate: ocr.angle || 0 },
+                        { translateY: -(by + bh / 2) },
+                        { translateX: -(bx + bw / 2) },
+                        ...(style.italicSlant !== 0 ? [
+                          { translateX: bx },
+                          { skewX: style.italicSlant },
+                          { translateX: -bx },
+                        ] : [])
+                      ]}
                     >
                       <Paragraph
                         paragraph={para!}

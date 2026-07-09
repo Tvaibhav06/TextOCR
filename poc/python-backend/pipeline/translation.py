@@ -95,6 +95,7 @@ class TranslationResult:
     src_lang: str = ""
     tgt_lang: str = ""
     error:    Optional[str] = None
+    failed:   bool = False    # True when all engines fail to translate
 
 
 # ── IndicTrans2 Engine ────────────────────────────────────────────────────────
@@ -489,6 +490,7 @@ class TranslationRouter:
                 src_lang=src,
                 tgt_lang=tgt,
                 error=str(exc),
+                failed=True,
             )
 
     # ── Private helpers ───────────────────────────────────────────────────────

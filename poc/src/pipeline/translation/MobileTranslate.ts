@@ -261,42 +261,45 @@ class MobileTranslator {
       await ensureModelDownloaded(src, progressOnce);
     }
 
-    // Translate regions sequentially (ML Kit is single-threaded on device)
-    return Promise.all(
-      ocrResults.map(async (ocr): Promise<MobileTranslationResult> => {
-        if (ocr.skip) {
-          // Pass through skipped regions — Stage 7 won't render them
-          return { text: ocr.text, engine: 'mlkit', srcLang: src, tgtLang: tgt };
-        }
+    // Sequential processing — ML Kit Translation on Android is single-threaded.
+    // Promise.all() can cause OOM or incorrect results with 15+ concurrent requests.
+    const results: MobileTranslationResult[] = [];
+    for (const ocr of ocrResults) {
+      if (ocr.skip) {
+        // Pass through skipped regions — Stage 7 won't render them
+        results.push({ text: ocr.text, engine: 'mlkit', srcLang: src, tgtLang: tgt });
+        continue;
+      }
 
-        let detectedSrc = src;
-        if (src === 'auto') {
-          // 1. ML Kit detector
-          detectedSrc = await this.identifyLanguage(ocr.text);
+      let detectedSrc = src;
+      if (src === 'auto') {
+        // 1. ML Kit detector
+        detectedSrc = await this.identifyLanguage(ocr.text);
 
-          // 2. Fallback if uncertain
-          if (detectedSrc === 'und') {
-            detectedSrc = this.identifyScriptHint(ocr.text);
-          }
-
-          // 3. Last resort fallback for short pure Latin
-          if (detectedSrc === 'und' && /^[a-zA-Z\s]+$/.test(ocr.text.trim()) && ocr.text.trim().length > 0) {
-            detectedSrc = 'en';
-          }
-
-          if (detectedSrc !== 'und') {
-            await ensureModelDownloaded(detectedSrc, progressOnce);
-          }
-        }
-
-        // If it's completely undetermined, pass it through
+        // 2. Fallback if uncertain
         if (detectedSrc === 'und') {
-          return { text: ocr.text, engine: 'mlkit', srcLang: 'und', tgtLang: tgt };
+          detectedSrc = this.identifyScriptHint(ocr.text);
         }
 
-        return this.translate(ocr.text, detectedSrc, tgt);
-      }),
-    );
+        // 3. Last resort fallback for short pure Latin
+        if (detectedSrc === 'und' && /^[a-zA-Z\s]+$/.test(ocr.text.trim()) && ocr.text.trim().length > 0) {
+          detectedSrc = 'en';
+        }
+
+        if (detectedSrc !== 'und') {
+          await ensureModelDownloaded(detectedSrc, progressOnce);
+        }
+      }
+
+      // If it's completely undetermined, pass it through
+      if (detectedSrc === 'und') {
+        results.push({ text: ocr.text, engine: 'mlkit', srcLang: 'und', tgtLang: tgt });
+        continue;
+      }
+
+      results.push(await this.translate(ocr.text, detectedSrc, tgt));
+    }
+    return results;
   }
 
   /**
@@ -324,6 +327,11 @@ class MobileTranslator {
     if (/[\u0600-\u06FF]/.test(text)) return 'ur'; // Arabic/Urdu
     if (/[\u4E00-\u9FFF]/.test(text)) return 'zh'; // Chinese/Kanji
     if (/[\u0400-\u04FF]/.test(text)) return 'ru'; // Cyrillic
+    if (/[\u3040-\u309F\u30A0-\u30FF]/.test(text)) return 'ja'; // Hiragana + Katakana
+    if (/[\uAC00-\uD7FF]/.test(text)) return 'ko'; // Hangul syllables
+    if (/[\u0A80-\u0AFF]/.test(text)) return 'gu'; // Gujarati
+    if (/[\u0C80-\u0CFF]/.test(text)) return 'kn'; // Kannada
+    if (/[\u0D00-\u0D7F]/.test(text)) return 'ml'; // Malayalam
     return 'und';
   }
 
@@ -347,13 +355,13 @@ class MobileTranslator {
       return false;
     }
     try {
+      // Share a single deadline across both downloads — worst-case wait is
+      // timeoutMs (not 2× timeoutMs as with two independent race() calls).
+      const deadline = new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error('timeout')), timeoutMs));
       await Promise.race([
-        ensureModelDownloaded('en'),  // source model (English is almost always cached)
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs)),
-      ]);
-      await Promise.race([
-        ensureModelDownloaded(tgt),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs)),
+        Promise.all([ensureModelDownloaded('en'), ensureModelDownloaded(tgt)]),
+        deadline,
       ]);
       return true;
     } catch (e) {

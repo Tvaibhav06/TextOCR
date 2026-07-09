@@ -133,6 +133,22 @@ export default function App() {
     return { uri: res.uri, w: nw, h: nh };
   };
 
+  /**
+   * F-1: Checks that a cached file URI still exists on disk.
+   * Returns the URI if it is still present, or null if it has been GC’d.
+   * Used to guard the ‘failed’ translation path where resultUri is not
+   * refreshed and may point to a deleted cache file.
+   */
+  const verifyResultUri = async (uri: string | null): Promise<string | null> => {
+    if (!uri) return null;
+    try {
+      const info = await FileSystem.getInfoAsync(uri);
+      return info.exists ? uri : null;
+    } catch {
+      return null;
+    }
+  };
+
   const pickGallery = async () => {
     try {
       const res = await ImagePicker.launchImageLibraryAsync({
@@ -248,6 +264,19 @@ export default function App() {
         // For PC path: update resultUri to the server-rendered image
         resultUri: session.path === 'pc' ? session.outputUri : prev.resultUri,
       }));
+
+      // F-1: On the 'failed' path resultUri is not updated, but the cached
+      // inpainted file may have been GC’d. Verify it still exists and clear
+      // to null if not, so the UI doesn’t silently show a broken image.
+      if (session.path === 'failed') {
+        const currentUri = s.resultUri;
+        verifyResultUri(currentUri).then(verified => {
+          if (verified === null && currentUri !== null) {
+            console.warn('[App] F-1: resultUri no longer exists on disk — clearing:', currentUri);
+            setS(prev => prev.resultUri === currentUri ? { ...prev, resultUri: null } : prev);
+          }
+        });
+      }
     } catch (e: any) {
       console.error('Translation error:', e);
       Alert.alert('Translation Failed', e.message);
@@ -273,7 +302,7 @@ export default function App() {
 
     // Copy to a fresh temp file first.
     // MediaLibrary on Android cannot always read files directly from the
-    // app’s internal cacheDirectory, so this copy step is mandatory.
+    // app's internal cacheDirectory, so this copy step is mandatory.
     const tmpPath = `${FileSystem.cacheDirectory ?? ''}save_${Date.now()}.jpg`;
     try {
       await FileSystem.copyAsync({ from: uriToSave, to: tmpPath });
@@ -283,7 +312,9 @@ export default function App() {
       console.error('[App] saveResult failed:', err);
       Alert.alert('Save Failed', err?.message ?? 'Could not save image. Please try again.');
     } finally {
-      // Always clean up the temp file whether save succeeded or failed.
+      // S-3: Add 200ms grace period before deletion so OEM file-system flushes
+      // complete before the temp file is removed.
+      await new Promise(r => setTimeout(r, 200));
       FileSystem.deleteAsync(tmpPath, { idempotent: true }).catch(() => {});
     }
   };
@@ -475,7 +506,13 @@ export default function App() {
               console.log('[App] Stage 7 snapshot received:', uri);
               setS(prev => {
                 if (prev.mobileSnapshotUri === uri) return prev; // idempotent
-                return { ...prev, mobileSnapshotUri: uri };
+                return {
+                  ...prev,
+                  mobileSnapshotUri: uri,
+                  // S-2: keep resultUri in sync so legacy saveResult() path also saves
+                  // the fully-rendered translated image, not the raw inpainted background.
+                  resultUri: uri,
+                };
               });
             }}
           />
@@ -507,6 +544,16 @@ export default function App() {
           onTargetLangChange={(lang) => setS(prev => ({ ...prev, targetLang: lang }))}
           translationSession={s.translationSession}
           renderCoverage={s.renderCoverage}
+          // S-1: Save is only ready when:
+          // • Translation is not on the mobile path (no snapshot needed), OR
+          // • The mobile snapshot has already been generated
+          isSaveReady={
+            !(
+              FEATURES.TRANSLATION_ENABLED &&
+              s.translationSession?.path === 'mobile' &&
+              !s.mobileSnapshotUri
+            )
+          }
         />
       )}
     </View>
