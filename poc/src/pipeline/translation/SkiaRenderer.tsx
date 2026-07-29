@@ -24,7 +24,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
-import { View, LayoutChangeEvent, ActivityIndicator, Text as RNText, StyleSheet } from 'react-native';
+import { View, LayoutChangeEvent, ActivityIndicator, Text as RNText } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import {
   Canvas,
@@ -575,8 +575,7 @@ const DEFAULT_STYLE: RegionStyle = {
 // ── Paragraph builder ─────────────────────────────────────────────────────────
 
 const SYSTEM_FALLBACK_FAMILIES = [
-  'System',
-  'sans-serif',
+  'sans-serif',          // most reliable: Roboto on Android, SF Pro on iOS; never produces tofu for Latin
   'Noto Sans CJK SC',
   'Noto Sans CJK TC',
   'Noto Sans CJK JP',
@@ -587,6 +586,15 @@ const SYSTEM_FALLBACK_FAMILIES = [
   'Apple SD Gothic Neo'
 ];
 
+// Languages where translated text is typically longer than English and whose scripts
+// have ascender/matra overhang that Skia's getHeight() underestimates.
+// For these: use a lower starting font size and a tighter height cap.
+const VERBOSE_SCRIPT_LANGS = new Set([
+  'hi', 'mr', 'bn', 'ta', 'te', 'kn', 'gu', 'pa', // Indic
+  'ur', 'ar', 'fa', 'he',                           // RTL Semitic
+  'th', 'vi', 'tr',                                 // other verbose targets
+]);
+
 function buildParagraph(
   text: string,
   textColor: ReturnType<typeof Skia.Color>,
@@ -596,14 +604,27 @@ function buildParagraph(
   rtl: boolean,
   weight: FontWeight,
   customFonts: any,
-  bestSystemFallback: string
+  bestSystemFallback: string,
+  targetLang: string = 'en'   // BUG-2/5: script-aware sizing
 ) {
   const fontMgr = customFonts;
-  // Start with a large font size and iteratively step down until it fits
-  let fontSize = maxHeight * 1.5;
+  const isVerbose = VERBOSE_SCRIPT_LANGS.has(targetLang);
+
+  // BUG-5: Verbose/Indic scripts translate to longer text and have matra overhang.
+  // Start at 80% of maxHeight instead of 150% so the loop starts closer to the answer.
+  // Latin/CJK keeps the 1.5× start which is safe for short translated text.
+  const startFactor = isVerbose ? 0.8 : 1.5;
+  let fontSize = maxHeight * startFactor;
   let para: ReturnType<typeof Skia.ParagraphBuilder.Make> | any = null;
 
-  for (let i = 0; i < 20; i++) {
+  // BUG-2: 30 iterations (was 20), 8% step (was 10%) for finer convergence.
+  const MAX_ITER = 30;
+  const STEP     = 0.92;
+  // BUG-2: Devanagari matras (ि, ा, ु …) extend beyond what getHeight() reports.
+  // Apply a 12% headroom for verbose scripts to prevent visible overflow.
+  const heightCap = isVerbose ? maxHeight * 0.88 : maxHeight;
+
+  for (let i = 0; i < MAX_ITER; i++) {
     const paraStyle = {
       textAlign:     TextAlign.Center,
       textDirection: rtl ? 1 : 0,
@@ -638,21 +659,17 @@ function buildParagraph(
     const longestLine = para.getLongestLine ? para.getLongestLine() : 0;
     
     const fitsHorizontally = longestLine <= maxWidth;
-    const fitsVertically = para.getHeight() <= maxHeight;
 
     if (lineCount === 1) {
-      // Single line text: Trust the mathematically perfect cap-height font size.
-      // Ignore para.getHeight() because typographic ascenders/descenders artificially inflate it.
+      // Single line: trust horizontal fit; ignore getHeight() (ascenders inflate it).
       if (fitsHorizontally) break;
     } else {
-      // Multi-line text: Must fit entirely within the original bounding box height and width.
-      if (fitsHorizontally && fitsVertically) break;
+      // Multi-line: must fit within heightCap (with Indic matra headroom applied).
+      if (fitsHorizontally && para.getHeight() <= heightCap) break;
     }
 
-    if (fontSize <= 4) {
-      break;
-    }
-    fontSize = Math.floor(fontSize * 0.90);
+    if (fontSize <= 4) break;
+    fontSize = Math.floor(fontSize * STEP);
   }
   return para;
 }
@@ -732,6 +749,10 @@ export function TranslatedOverlay({
   
   const [fontsTimeout, setFontsTimeout] = useState(false);
   useEffect(() => {
+    if (customFonts != null) {
+      // Fonts loaded successfully, do not trigger timeout
+      return;
+    }
     const timer = setTimeout(() => {
       setFontsTimeout(true);
       // F-4: Upgrade from silent log to visible error — bundled fonts should
@@ -749,7 +770,7 @@ export function TranslatedOverlay({
       }
     }, 10000);
     return () => clearTimeout(timer);
-  }, [onRenderComplete]);
+  }, [onRenderComplete, customFonts]);
 
 
   const fontsLoaded = customFonts != null || fontsTimeout;
@@ -775,6 +796,19 @@ export function TranslatedOverlay({
     }
     return 'sans-serif';
   }, []);
+
+  // ── OCR coordinate scale: original-image space → inpainted-image space ─────
+  // OCR bboxes come from the original image. The inpainted image may be smaller
+  // (backend downscales before inpainting). buildParagraph must receive the
+  // inpainted-space dimensions to match what the Canvas JSX actually draws.
+  const ocrScale = useMemo(() => {
+    if (!inpaintedImage) return { x: 1, y: 1 };
+    const inpW = inpaintedImage.width();
+    const inpH = inpaintedImage.height();
+    const srcW = imageWidth  > 1 ? imageWidth  : inpW;
+    const srcH = imageHeight > 1 ? imageHeight : inpH;
+    return { x: inpW / srcW, y: inpH / srcH };
+  }, [inpaintedImage, imageWidth, imageHeight]);
 
   // ── Per-region style extraction — runs once after fonts and images load ───
   // Extracts text color, bg color, font class, and weight from pixel data.
@@ -919,10 +953,10 @@ export function TranslatedOverlay({
     setRegionStyles(styles);
   }, [fontsLoaded, originalImage, inpaintedImage, ocrResults, targetLang]);
 
-  // ── Build paragraphs — memoized, only after fonts + styles are ready ──────
-  const { regions, renderedCount, totalCount } = useMemo(() => {
+  // ── Build paragraphs and collect restored regions ─────────────────────────
+  const { regions, restoredRegions, renderedCount, totalCount } = useMemo(() => {
     if (!fontsLoaded || regionStyles.length === 0) {
-      return { regions: [], renderedCount: 0, totalCount: 0 };
+      return { regions: [], restoredRegions: [], renderedCount: 0, totalCount: 0 };
     }
 
     const paired = ocrResults.map((ocr, i) => ({
@@ -931,22 +965,43 @@ export function TranslatedOverlay({
       style: regionStyles[i] ?? DEFAULT_STYLE,
     }));
 
+    // Collect regions that must be restored from original pixels.
+    // These are regions where the translation engine decided the source language
+    // does not match the user's selected source filter.
+    const restoredRegions = paired
+      .filter(({ tr }) => tr?.engine === 'restored')
+      .map(({ ocr }) => ocr);
+
     // Eligible regions: non-skipped OCR results that have either a successful
     // translation OR the original OCR text as a fallback.
-    // When engine==='failed', we use ocr.text so the user sees the original
-    // text instead of a blank erased region — mirrors PC path (renderer.py).
+    //
+    // BUG-3a: Three cases kept strictly separate:
+    //   engine='mlkit'    — successful translation. Use tr.text as-is.
+    //   engine='failed'   — translation attempted but failed. Render ocr.text as
+    //                        a visible fallback. Labeled with translationFailed=true.
+    //   engine='restored' — excluded here; rendered as pixel composites below.
     const eligible = paired
-      .filter(({ ocr, tr }) => !ocr.skip && tr)
-      .map(({ ocr, tr, style }) => ({
-        ocr,
-        tr: tr.engine === 'failed'
-          ? { ...tr, text: ocr.text ?? '' }  // fallback to original OCR text
-          : tr,
-        style,
-      }))
+      .filter(({ ocr, tr }) => !ocr.skip && tr && tr.engine !== 'restored')
+      .map(({ ocr, tr, style }) => {
+        const translationFailed = tr.engine === 'failed';
+        if (translationFailed) {
+          console.warn(
+            `[SkiaRenderer] BUG-3a: Region ${ocr.detId}: translation failed — ` +
+            `rendering original OCR text "${(ocr.text ?? '').substring(0, 40)}" as fallback.`
+          );
+        }
+        return {
+          ocr,
+          // For failed regions, fall back to original OCR text so the user sees
+          // the source text rather than a blank erased hole.
+          tr: translationFailed ? { ...tr, text: ocr.text ?? '' } : tr,
+          style,
+          translationFailed,
+        };
+      })
       .filter(({ tr }) => !!tr.text?.trim());
 
-    const built = eligible.map(({ ocr, tr, style }) => {
+    const built = eligible.map(({ ocr, tr, style, translationFailed }) => {
       try {
         const fontName = getFontAssetName(style.fontClass, style.weight, targetLang);
 
@@ -954,28 +1009,38 @@ export function TranslatedOverlay({
           tr.text,
           style.textColor,
           fontName,
-          ocr.bbox.width,
-          ocr.bbox.height,
+          // BUG-4: pass inpainted-space dims so paragraph layout matches Canvas draw width.
+          ocr.bbox.width  * ocrScale.x,
+          ocr.bbox.height * ocrScale.y,
           rtl,
           style.weight,
           customFonts,
-          bestSystemFallback
+          bestSystemFallback,
+          targetLang             // BUG-2/5: script-aware font sizing
         );
-        return { ocr, para, style, ok: true };
+        return { ocr, para, style, translationFailed, ok: true };
       } catch (e) {
         console.warn('[SkiaRenderer] Paragraph build failed for region', ocr.detId, e);
-        return { ocr, para: null, style, ok: false };
+        return { ocr, para: null, style, translationFailed, ok: false };
       }
     }).filter(r => r.ok && r.para != null);
 
-    console.log(`[SkiaRenderer] Built ${built.length}/${eligible.length} paragraphs for lang=${targetLang}`);
+    const failedCount = built.filter(r => r.translationFailed).length;
+    if (failedCount > 0) {
+      console.warn(
+        `[SkiaRenderer] BUG-3a: ${failedCount} region(s) used original OCR text ` +
+        `(translation failed). Check ML Kit logs for details.`
+      );
+    }
+    console.log(`[SkiaRenderer] Built ${built.length}/${eligible.length} paragraphs for lang=${targetLang}, ${restoredRegions.length} restored, ${failedCount} failed-fallback`);
 
     return {
-      regions:      built,
-      renderedCount: built.length,
-      totalCount:   eligible.length,
+      regions:        built,
+      restoredRegions,
+      renderedCount:  built.length,
+      totalCount:     eligible.length,
     };
-  }, [ocrResults, translationResults, targetLang, rtl, fontsLoaded, regionStyles, bestSystemFallback]);
+  }, [ocrResults, translationResults, targetLang, rtl, fontsLoaded, regionStyles, bestSystemFallback, ocrScale]);
 
   // ── Fire quality callback once paragraphs are built ───────────────────────
   const onRenderCompleteRef = useRef(onRenderComplete);
@@ -999,37 +1064,86 @@ export function TranslatedOverlay({
   useEffect(() => { onSnapshotRef.current = onSnapshot; }, [onSnapshot]);
 
   const generateSnapshot = useCallback(async () => {
-    if (!onSnapshotRef.current || !inpaintedImage || regions.length === 0) return;
+    if (!onSnapshotRef.current || !inpaintedImage) return;
+
+    // BUG-1: F-2 fast-path — only valid when style extraction has proven the regions
+    // are GENUINELY empty, not just not-yet-built.
+    // regionStyles.length === 0 means the style-extraction useEffect hasn't run yet
+    // (early mount). In that case, bail silently and wait for the next fire.
+    if (regions.length === 0 && restoredRegions.length === 0) {
+      if (regionStyles.length === 0) {
+        // Still on initial mount — paragraph build hasn't happened yet.
+        // The useEffect will re-fire once regionStyles populates.
+        return;
+      }
+      // regionStyles populated but truly zero renderable regions (all OCR skipped).
+      console.log('[SkiaRenderer] BUG-1/F-2: Render-ready, zero regions — snapshotting background.');
+      onSnapshotRef.current(inpaintedUri);
+      return;
+    }
     try {
-      // Use original image dimensions as canvas size so the saved image is full-res.
-      const srcW = imageWidth  > 1 ? imageWidth  : inpaintedImage.width();
-      const srcH = imageHeight > 1 ? imageHeight : inpaintedImage.height();
+      // BUG-4 follow-up: The paragraphs were built using scaled dimensions
+      // (ocr.bbox * ocrScale). To make the snapshot match the display EXACTLY,
+      // the snapshot surface must be the exact same size as the inpainted image.
+      // If we use the original image dimensions, the text paragraphs (which were
+      // already wrapped and laid out for the smaller inpainted image) will not
+      // match the new surface scale, leading to tiny, overflowing, or misaligned text.
+      //
+      // Using inpW/inpH also guarantees memory safety, since the inpainted image
+      // is already decoded and rendering on screen (the backend downscales it
+      // if it was too large).
+      const inpW = inpaintedImage.width();
+      const inpH = inpaintedImage.height();
+      const snapW = inpW;
+      const snapH = inpH;
 
       // CPU-backed offscreen surface (safe to call from JS thread).
-      const surface = Skia.Surface.Make(srcW, srcH);
+      const surface = Skia.Surface.Make(snapW, snapH);
       if (!surface) {
         console.warn('[SkiaRenderer] Snapshot: could not create offscreen surface');
         return;
       }
       const canvas = surface.getCanvas();
 
-      // Layer 1: inpainted image scaled to fill the full source resolution.
-      const inpW = inpaintedImage.width();
-      const inpH = inpaintedImage.height();
+      // Layer 1: inpainted image drawn at 1:1 scale (it perfectly fills the surface).
       canvas.drawImageRect(
         inpaintedImage,
-        Skia.XYWHRect(0, 0, inpW, inpH),   // src rect (native inpainted dims)
-        Skia.XYWHRect(0, 0, srcW, srcH),   // dst rect (full original dims)
+        Skia.XYWHRect(0, 0, inpW, inpH),     // src rect (native inpainted dims)
+        Skia.XYWHRect(0, 0, snapW, snapH),   // dst rect (snapshot surface dims)
         Skia.Paint(),
       );
 
+      // Layer 1.5: Restore original pixels for 'restored' regions.
+      if (originalImage && restoredRegions.length > 0) {
+        const origW = originalImage.width();
+        const origH = originalImage.height();
+        for (const ocr of restoredRegions) {
+          const bx = ocr.bbox.x * ocrScale.x;
+          const by = ocr.bbox.y * ocrScale.y;
+          const bw = ocr.bbox.width  * ocrScale.x;
+          const bh = ocr.bbox.height * ocrScale.y;
+          canvas.save();
+          const rRect = Skia.RRectXY(Skia.XYWHRect(bx, by, bw, bh), 1, 1);
+          canvas.clipRRect(rRect, ClipOp.Intersect, true /* anti-alias */);
+          canvas.drawImageRect(
+            originalImage,
+            Skia.XYWHRect(0, 0, origW, origH),
+            Skia.XYWHRect(0, 0, snapW, snapH),  // dst: snapshot surface, not original
+            Skia.Paint(),
+          );
+          canvas.restore();
+        }
+      }
+
       // Layer 2: translated text paragraphs.
-      // OCR bboxes are already in original-image pixel space — no scaling needed.
+      // Because snapW === inpW, the paragraph's already-built layout exactly matches
+      // the canvas draw space. We can reuse ocrScaleX/ocrScaleY directly, just like
+      // the live display path.
       for (const { ocr, para, style } of regions) {
-        const bx = ocr.bbox.x;
-        const by = ocr.bbox.y;
-        const bw = ocr.bbox.width;
-        const bh = ocr.bbox.height;
+        const bx = ocr.bbox.x      * ocrScale.x;
+        const by = ocr.bbox.y      * ocrScale.y;
+        const bw = ocr.bbox.width  * ocrScale.x;
+        const bh = ocr.bbox.height * ocrScale.y;
 
         // Background fill when contrast is low (mirrors live render logic).
         if (style.bgAlpha > 0) {
@@ -1043,7 +1157,7 @@ export function TranslatedOverlay({
 
         // Paragraph — vertically centred inside the bbox (same as live render).
         const paraY = by + Math.max(0, (bh - para!.getHeight()) / 2);
-        canvas.drawParagraph(para!, bx, paraY);
+        para!.paint(canvas, bx, paraY);
       }
 
       // Encode to JPEG base64 and write to cache.
@@ -1060,21 +1174,24 @@ export function TranslatedOverlay({
       // Never crash the overlay — just log and continue.
       console.warn('[SkiaRenderer] Snapshot generation failed (overlay still visible):', err);
     }
-  }, [inpaintedImage, imageWidth, imageHeight, regions]);
+  }, [inpaintedImage, originalImage, imageWidth, imageHeight, regions, restoredRegions, regionStyles, inpaintedUri]);
 
-  // Trigger snapshot generation once paragraphs are ready.
+  // F-2: Trigger snapshot generation once paragraphs are ready.
+  // Fire even when regions are empty (all OCR skipped) so the Save button is
+  // never permanently disabled. generateSnapshot() handles the empty case by
+  // snapshotting the inpainted background directly.
   useEffect(() => {
-    if (fontsLoaded && regions.length > 0) {
+    if (fontsLoaded && inpaintedImage) {
       generateSnapshot();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [regions, fontsLoaded]);
+  }, [regions, restoredRegions, fontsLoaded, inpaintedImage]);
 
   const [layout, setLayout] = useState({ width: 0, height: 0 });
 
   return (
     <View
-      style={StyleSheet.absoluteFillObject}
+      style={{ flex: 1 }}
       onLayout={(e: LayoutChangeEvent) => {
         const { width, height } = e.nativeEvent.layout;
         if (width > 0 && height > 0) {
@@ -1088,15 +1205,7 @@ export function TranslatedOverlay({
         </View>
       ) : (
         <>
-      {(!inpaintedImage || layout.width === 0 || layout.height === 0) && (
-        <View style={{ position: 'absolute', top: 20, left: 20, backgroundColor: 'rgba(0,0,0,0.8)', padding: 10, zIndex: 999 }}>
-          <RNText style={{ color: 'white' }}>Debug Info:</RNText>
-          <RNText style={{ color: 'white' }}>layout: {layout.width}x{layout.height}</RNText>
-          <RNText style={{ color: 'white' }}>inpaintedImage: {inpaintedImage ? 'LOADED' : 'NULL'}</RNText>
-          <RNText style={{ color: 'white' }}>originalImage: {originalImage ? 'LOADED' : 'NULL'}</RNText>
-          <RNText style={{ color: 'white' }}>inpaintedUri: {inpaintedUri}</RNText>
-        </View>
-      )}
+
       {layout.width > 0 && layout.height > 0 && inpaintedImage && (() => {
         // ── Use the actual inpainted pixel dimensions as the canvas coordinate space.
         // The inpainted image may differ from the original if the backend downscaled it.
@@ -1134,8 +1243,34 @@ export function TranslatedOverlay({
                 fit="fill"
               />
 
+              {/* Layer 1.5: Restore original pixels for non-selected-language regions.
+               *  Drawn AFTER the inpainted base but BEFORE translated paragraphs.
+               *  This ensures translated text always sits on top of restored pixels. */}
+              {originalImage && restoredRegions.map((ocr, idx) => {
+                const bx = ocr.bbox.x      * ocrScaleX;
+                const by = ocr.bbox.y      * ocrScaleY;
+                const bw = ocr.bbox.width  * ocrScaleX;
+                const bh = ocr.bbox.height * ocrScaleY;
+                return (
+                  <Group key={`restored-${ocr.detId}-${idx}`}
+                    clip={Skia.RRectXY(Skia.XYWHRect(bx, by, bw, bh), 2, 2)}>
+                    {/* Draw the full original image clipped to this region's bounding box.
+                     *  The clip path uses anti-aliasing via RRectXY (1px corner radius)
+                     *  to soften the seam at the boundary. */}
+                    <Image
+                      image={originalImage}
+                      x={0}
+                      y={0}
+                      width={inpW}
+                      height={inpH}
+                      fit="fill"
+                    />
+                  </Group>
+                );
+              })}
+
               {/* Layer 2: Per-region background fill + translated text overlay */}
-              {regions.map(({ ocr, para, style }, idx) => {
+              {regions.map(({ ocr, para, style, translationFailed }, idx) => {
                 // Map OCR bbox from original-image space to inpainted-image space
                 const bx = ocr.bbox.x      * ocrScaleX;
                 const by = ocr.bbox.y      * ocrScaleY;
@@ -1193,6 +1328,22 @@ export function TranslatedOverlay({
                         width={bw}
                       />
                     </Group>
+
+                    {/* BUG-3a: Amber border for failed-translation regions (live overlay only).
+                     *  Signals "translation failed — original OCR text shown".
+                     *  NOT drawn in the offscreen snapshot so the saved image is clean. */}
+                    {translationFailed && (
+                      <RoundedRect
+                        x={bx + 0.75}
+                        y={by + 0.75}
+                        width={Math.max(0, bw - 1.5)}
+                        height={Math.max(0, bh - 1.5)}
+                        r={2}
+                        color="rgba(255, 165, 0, 0.75)"
+                        style="stroke"
+                        strokeWidth={1.5}
+                      />
+                    )}
                   </Group>
                 );
               })}

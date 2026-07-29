@@ -30,6 +30,13 @@ export interface TranslationSession {
   outputUri:  string;
   originalUri: string;
   targetLang: string;
+  /**
+   * The source language filter that was active when this session was created.
+   * 'auto' = no filter (original behavior, all eligible regions translated).
+   * Any explicit BCP-47 code = only regions matching that language were translated;
+   * non-matching regions have engine='restored' in their translation results.
+   */
+  sourceLang: string;
 
   /**
    * Mobile rendering data — non-null only when path === 'mobile'.
@@ -66,6 +73,9 @@ export class TranslationService {
    * @param result      Completed PipelineResult from Stages 1–4.
    * @param targetLang  BCP-47 target language code.
    * @param onProgress  Optional UI progress callback.
+   * @param preferredPath  'mobile' | 'pc' — which path to attempt first.
+   * @param existingOcrResults  Mobile OCR results to inject into PC path.
+   * @param sourceLang  BCP-47 source language filter. 'auto' = no filter (default).
    */
   static async run(
     result:     PipelineResult,
@@ -73,9 +83,10 @@ export class TranslationService {
     onProgress?: (stage: string, detail?: string) => void,
     preferredPath: 'mobile' | 'pc' = 'mobile',
     existingOcrResults?: any[],
+    sourceLang: string = 'auto',
   ): Promise<TranslationSession> {
     const routerResult: TranslationRouterResult = await translationRouter.run(
-      result, targetLang, onProgress, preferredPath, existingOcrResults
+      result, targetLang, onProgress, preferredPath, existingOcrResults, sourceLang,
     );
 
     // Map router result directly to TranslationSession (same shape)
@@ -86,6 +97,7 @@ export class TranslationService {
       outputUri:       routerResult.outputUri,
       originalUri:     routerResult.originalUri,
       targetLang:      routerResult.targetLang,
+      sourceLang:      routerResult.sourceLang,
       mobileData:      routerResult.mobileData,
       totalMs:         routerResult.totalMs,
       translatedCount: routerResult.translatedCount,

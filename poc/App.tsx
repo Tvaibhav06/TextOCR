@@ -72,6 +72,12 @@ interface AppState {
   isTranslating: boolean;
   translationStage: string;  // live status message while translating
   targetLang: string;
+  /**
+   * User-selected source language filter.
+   * 'auto' = translate all detected regions (existing behavior).
+   * BCP-47 code = only translate regions matching this language; others are restored.
+   */
+  sourceLang: string;
   /** Stage 7 mobile render coverage — set by onRenderComplete callback. */
   renderCoverage: number | null;
   /**
@@ -82,6 +88,14 @@ interface AppState {
    */
   mobileSnapshotUri: string | null;
   isFullscreenPreview: boolean;
+  /**
+   * S-2: Monotonically-incrementing nonce, incremented at the START of every
+   * runTranslation() call. The onSnapshot callback captures this value at render
+   * time and rejects any snapshot whose nonce does not match the current value,
+   * preventing a stale SkiaRenderer from a prior run from overwriting the current
+   * session's resultUri.
+   */
+  translationSessionId: number;
 }
 
 const initialState: AppState = {
@@ -95,14 +109,19 @@ const initialState: AppState = {
   isTranslating: false,
   translationStage: '',
   targetLang: 'hi',
+  sourceLang: 'auto',
   renderCoverage: null,
   mobileSnapshotUri: null,
   isFullscreenPreview: false,
+  translationSessionId: 0,
 };
 
 export default function App() {
   const [s, setS] = useState<AppState>(initialState);
   const tokenRef = useRef<CancellationToken | null>(null);
+  // BUG-6: useRef so onSnapshot always reads the live session ID, never a stale closure.
+  const sessionIdRef = useRef(0);
+  useEffect(() => { sessionIdRef.current = s.translationSessionId; }, [s.translationSessionId]);
   const progressAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -228,7 +247,9 @@ export default function App() {
     // Pass existing mobile OCR results if they exist (to bypass PC detection/OCR)
     const existingOcrResults = s.translationSession?.mobileData?.ocrResults;
 
-    setS(prev => ({ ...prev, isTranslating: true, translationStage: 'Starting…', translationSession: null, renderCoverage: null, mobileSnapshotUri: null }));
+    setS(prev => ({ ...prev, isTranslating: true, translationStage: 'Starting…', translationSession: null, renderCoverage: null, mobileSnapshotUri: null,
+      // S-2: Increment nonce so any in-flight onSnapshot from the prior session is rejected.
+      translationSessionId: prev.translationSessionId + 1 }));
 
     const onProgress = (stage: string, detail?: string) => {
       setS(prev => ({ ...prev, translationStage: detail ?? stage }));
@@ -242,19 +263,10 @@ export default function App() {
         onProgress,
         preferredPath,
         existingOcrResults,
+        s.sourceLang,
       );
 
-      // --- TEMP POPUP FOR TESTING STAGE 5 & 6 ---
-      let translatedTexts = '';
-      if (session.path === 'mobile' && session.mobileData) {
-        translatedTexts = session.mobileData.translationResults.map(r => r.text).join('\n');
-      } else if (session.pcTranslatedTexts && session.pcTranslatedTexts.length > 0) {
-        translatedTexts = session.pcTranslatedTexts.join('\n');
-      } else {
-        translatedTexts = 'Translation succeeded (empty)';
-      }
-      Alert.alert('Translated Text (Stages 5 & 6)', translatedTexts);
-      // ------------------------------------------
+
 
       setS(prev => ({
         ...prev,
@@ -503,14 +515,20 @@ export default function App() {
               });
             }}
             onSnapshot={(uri) => {
+              // BUG-6: Read the live session ID from the ref, not the stale closure.
+              // The closure-captured s.translationSessionId can be stale if App
+              // re-rendered between when this callback was created and when it fires.
+              const capturedSessionId = sessionIdRef.current;
               console.log('[App] Stage 7 snapshot received:', uri);
               setS(prev => {
                 if (prev.mobileSnapshotUri === uri) return prev; // idempotent
+                if (prev.translationSessionId !== capturedSessionId) {
+                  console.warn('[App] BUG-6: Stale snapshot rejected (session changed)');
+                  return prev;
+                }
                 return {
                   ...prev,
                   mobileSnapshotUri: uri,
-                  // S-2: keep resultUri in sync so legacy saveResult() path also saves
-                  // the fully-rendered translated image, not the raw inpainted background.
                   resultUri: uri,
                 };
               });
@@ -541,7 +559,24 @@ export default function App() {
           isTranslating={s.isTranslating}
           translationStage={s.translationStage}
           targetLang={s.targetLang}
-          onTargetLangChange={(lang) => setS(prev => ({ ...prev, targetLang: lang }))}
+          onTargetLangChange={(lang) => setS(prev => ({
+            ...prev,
+            targetLang: lang,
+            // ST-1: Clear previous translation when target language changes so the
+            // UI signals to the user that re-translation is needed.
+            translationSession: null,
+            mobileSnapshotUri: null,
+            renderCoverage: null,
+          }))}
+          sourceLang={s.sourceLang}
+          onSourceLangChange={(lang) => setS(prev => ({
+            ...prev,
+            sourceLang: lang,
+            // Clear previous translation session when source language changes
+            // so the UI signals to the user that re-translation is needed.
+            translationSession: null,
+            mobileSnapshotUri: null,
+          }))}
           translationSession={s.translationSession}
           renderCoverage={s.renderCoverage}
           // S-1: Save is only ready when:

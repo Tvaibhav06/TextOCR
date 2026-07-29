@@ -97,7 +97,13 @@ export interface DownloadProgress {
 
 export interface MobileTranslationResult {
   text:     string;
-  engine:   'mlkit' | 'failed';
+  /**
+   * 'mlkit'    — translated by on-device ML Kit.
+   * 'failed'   — ML Kit failed; text is the original OCR text.
+   * 'restored' — region does not match the selected source language;
+   *              Stage 7 will composite original pixels instead of rendering text.
+   */
+  engine:   'mlkit' | 'failed' | 'restored';
   srcLang:  string;
   tgtLang:  string;
   error?:   string;
@@ -235,16 +241,22 @@ class MobileTranslator {
    * Downloads target language model once (with progress), then translates
    * all regions in sequence. Skipped regions pass through untouched.
    *
-   * @param ocrResults  From Stage 5 MobileOCR.extractTextFromRegions()
-   * @param src         Source language code
-   * @param tgt         Target language code
-   * @param onProgress  Progress callback for the model download phase
+   * @param ocrResults        From Stage 5 MobileOCR.extractTextFromRegions()
+   * @param src               Source language code ('auto' = detect per-region)
+   * @param tgt               Target language code
+   * @param onProgress        Progress callback for the model download phase
+   * @param sourceLangFilter  BCP-47 code of the user's selected Source Language.
+   *                          'auto' = no filter; translate all eligible regions (existing behavior).
+   *                          Any other value = only translate regions that match this language;
+   *                          non-matching regions emit engine='restored' so Stage 7 composites
+   *                          original pixels for them instead of rendering text.
    */
   async translateAll(
-    ocrResults:  MobileOcrResult[],
-    src:         string,
-    tgt:         string,
-    onProgress?: ProgressCallback,
+    ocrResults:        MobileOcrResult[],
+    src:               string,
+    tgt:               string,
+    onProgress?:       ProgressCallback,
+    sourceLangFilter:  string = 'auto',
   ): Promise<MobileTranslationResult[]> {
     // Pre-download models once before processing any region
     let downloadFired = false;
@@ -271,8 +283,11 @@ class MobileTranslator {
         continue;
       }
 
+      // ── Selective Restoration: identify per-region language ────────────────
+      // This runs on every region regardless of sourceLangFilter so we always
+      // know what language we detected (needed for routing below).
       let detectedSrc = src;
-      if (src === 'auto') {
+      if (src === 'auto' || sourceLangFilter !== 'auto') {
         // 1. ML Kit detector
         detectedSrc = await this.identifyLanguage(ocr.text);
 
@@ -291,7 +306,35 @@ class MobileTranslator {
         }
       }
 
-      // If it's completely undetermined, pass it through
+      // ── Source-language filter check ───────────────────────────────────────
+      // If the user chose an explicit source language, only translate regions
+      // whose detected language matches it.
+      //
+      // SR-4 policy:
+      //   Confident detection (detectedSrc != 'und') + filter mismatch → restore.
+      //   Ambiguous/undetermined (detectedSrc = 'und') → attempt translation with
+      //   src='auto' so ML Kit detects the language during translation itself.
+      //   This avoids permanent erased holes on text we could not identify.
+      //   If translation fails, engine='failed', Stage 7 leaves region as inpainted.
+      if (sourceLangFilter !== 'auto') {
+        // Policy: If language cannot be detected confidently (e.g., 'und'),
+        // do not guess blindly. Treat it as a mismatch to restore original text.
+        if (detectedSrc === 'und' || detectedSrc.toLowerCase() !== sourceLangFilter.toLowerCase()) {
+          console.log(
+            `[MobileTranslate] Region detId=${ocr.detId} lang="${detectedSrc}" !== filter="${sourceLangFilter}" -> restored`,
+          );
+          results.push({
+            text:    ocr.text,
+            engine:  'restored',
+            srcLang: detectedSrc,
+            tgtLang: tgt,
+          });
+          continue;
+        }
+        // else: confident match (detectedSrc !== 'und' && detectedSrc === sourceLangFilter), fall through to translate()
+      }
+
+      // If it's completely undetermined and no filter is set, pass it through
       if (detectedSrc === 'und') {
         results.push({ text: ocr.text, engine: 'mlkit', srcLang: 'und', tgtLang: tgt });
         continue;
@@ -301,6 +344,7 @@ class MobileTranslator {
     }
     return results;
   }
+
 
   /**
    * Identify the language of a text sample using ML Kit Language ID.

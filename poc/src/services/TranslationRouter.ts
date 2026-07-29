@@ -70,6 +70,12 @@ export interface TranslationRouterResult {
   /** Original image URI (used to build SkiaRenderer on mobile path). */
   originalUri: string;
   targetLang:  string;
+  /**
+   * Source language filter active for this result.
+   * 'auto' = all eligible regions were translated (original behavior).
+   * BCP-47 code = only matching regions were translated; rest have engine='restored'.
+   */
+  sourceLang:  string;
 
   /** Populated on mobile path only. Null on PC path. */
   mobileData: {
@@ -107,6 +113,7 @@ export class TranslationRouter {
     onProgress?: (stage: string, detail?: string) => void,
     preferredPath: 'mobile' | 'pc' = 'mobile',
     existingOcrResults?: MobileOcrResult[],
+    sourceLang: string = 'auto',
   ): Promise<TranslationRouterResult> {
     const t0 = Date.now();
     const originalUri = result.originalUri!;
@@ -119,6 +126,7 @@ export class TranslationRouter {
         outputUri:       result.outputUri,
         originalUri,
         targetLang,
+        sourceLang,
         mobileData:      null,
         totalMs:         Date.now() - t0,
         translatedCount: 0,
@@ -131,7 +139,7 @@ export class TranslationRouter {
       onProgress?.('mobile_start', `Translating on device…`);
 
       const mobileResult = await this._tryMobilePath(
-        result, targetLang, originalUri, detections, t0, onProgress,
+        result, targetLang, originalUri, detections, t0, onProgress, sourceLang,
       );
 
       // Return mobile result if successful
@@ -139,12 +147,12 @@ export class TranslationRouter {
 
       // Mobile failed, fallback to PC
       onProgress?.('pc_start', 'Device translation failed. Falling back to PC…');
-      return this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults);
+      return this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults, sourceLang);
 
     } else {
       // ── Preferred PC ────────────────────────────────────────────────────────
       onProgress?.('pc_start', 'Translating on PC server…');
-      const pcResult = await this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults);
+      const pcResult = await this._tryPcPath(result, targetLang, originalUri, t0, onProgress, existingOcrResults, sourceLang);
 
       // Return PC result if successful
       if (pcResult.path === 'pc') return pcResult;
@@ -152,7 +160,7 @@ export class TranslationRouter {
       // PC failed, fallback to Mobile
       onProgress?.('mobile_start', 'PC translation failed. Falling back to device…');
       const mobileFallback = await this._tryMobilePath(
-        result, targetLang, originalUri, detections, t0, onProgress,
+        result, targetLang, originalUri, detections, t0, onProgress, sourceLang,
       );
 
       // Return mobile result if successful, otherwise return the original PC failure
@@ -170,6 +178,7 @@ export class TranslationRouter {
     detections:  PipelineResult['detections'],
     t0:          number,
     onProgress?: (stage: string, detail?: string) => void,
+    sourceLang:  string = 'auto',
   ): Promise<TranslationRouterResult | null> {
     const imgW = result.width  ?? 1;
     const imgH = result.height ?? 1;
@@ -194,7 +203,7 @@ export class TranslationRouter {
     } catch (e: any) {
       console.warn('[TranslationRouter] Mobile OCR exception:', e);
       // F-3: Use distinct error code for OCR failures vs. translation failures
-      this._lastFallbackReason = 'mlkit_ocr_error';
+      this._lastFallbackReason = 'mlkit_error'; // Use valid FallbackReason
       this._lastFallbackDetail = `OCR failed: ${e?.message ?? e}`;
       return null;
     }
@@ -223,21 +232,23 @@ export class TranslationRouter {
     onProgress?.('mobile_translate', 'Translating text on device…');
     let translationResults: MobileTranslationResult[];
     try {
-      translationResults = await mobileTranslator.translateAll(ocrResults, 'auto', targetLang);
+      translationResults = await mobileTranslator.translateAll(ocrResults, 'auto', targetLang, undefined, sourceLang);
     } catch (e: any) {
       console.warn('[TranslationRouter] Mobile translation exception:', e);
       // F-3: Use distinct error code for translation failures vs. OCR failures
-      this._lastFallbackReason = 'mlkit_translate_error';
+      this._lastFallbackReason = 'mobile_translate_error'; // Use valid FallbackReason
       this._lastFallbackDetail = `Translation failed: ${e?.message ?? e}`;
       return null;
     }
 
     // ── Gate 3: translation availability ─────────────────────────────────────
+    // 'restored' regions are a feature, not a failure — exclude them from the rate check.
     const successCount = translationResults.filter(
-      r => r.engine !== 'failed' && r.text?.trim(),
+      r => r.engine !== 'failed' && r.engine !== 'restored' && r.text?.trim(),
     ).length;
-    const eligibleCount = ocrResults.filter(r => !r.skip).length;
-    const rate = eligibleCount > 0 ? successCount / eligibleCount : 0;
+    const restoredCount = translationResults.filter(r => r.engine === 'restored').length;
+    const eligibleCount = ocrResults.filter(r => !r.skip).length - restoredCount;
+    const rate = eligibleCount > 0 ? successCount / eligibleCount : 1; // if all restored, rate=1 (not a failure)
 
     if (rate < THRESHOLDS.MIN_TRANSLATION_AVAILABILITY) {
       console.log(`[TranslationRouter] Mobile gate 3 FAIL: translation rate ${rate.toFixed(2)} < ${THRESHOLDS.MIN_TRANSLATION_AVAILABILITY}`);
@@ -251,7 +262,7 @@ export class TranslationRouter {
     // fontClasses is intentionally omitted: SkiaRenderer classifies fonts
     // per-region itself; a hardcoded 'SANS_SERIF' array adds no value.
 
-    console.log(`[TranslationRouter] Mobile path SUCCESS: ${successCount}/${eligibleCount} regions in ${Date.now() - t0}ms`);
+    console.log(`[TranslationRouter] Mobile path SUCCESS: ${successCount}/${eligibleCount} regions translated, ${restoredCount} restored, in ${Date.now() - t0}ms`);
     onProgress?.('mobile_done', `Translated ${successCount} region${successCount !== 1 ? 's' : ''} on device`);
 
     return {
@@ -259,6 +270,7 @@ export class TranslationRouter {
       outputUri:       result.outputUri,   // inpainted image — SkiaRenderer overlays text
       originalUri,
       targetLang,
+      sourceLang,
       mobileData: {
         ocrResults,
         translationResults,
@@ -280,6 +292,7 @@ export class TranslationRouter {
     t0:          number,
     onProgress?: (stage: string, detail?: string) => void,
     existingOcrResults?: MobileOcrResult[],
+    sourceLang:  string = 'auto',
   ): Promise<TranslationRouterResult> {
     const fallbackReason = this._lastFallbackReason ?? 'mobile_translate_error';
     const fallbackDetail = this._lastFallbackDetail;
@@ -297,6 +310,7 @@ export class TranslationRouter {
         outputUri:       result.outputUri,   // show inpainted (no text) as best effort
         originalUri,
         targetLang,
+        sourceLang,
         mobileData:      null,
         totalMs:         Date.now() - t0,
         translatedCount: 0,
@@ -314,6 +328,7 @@ export class TranslationRouter {
       result.height ?? 1,
       result.detections,
       existingOcrResults,
+      sourceLang,
     );
 
     if (!pcResult) {
@@ -325,6 +340,7 @@ export class TranslationRouter {
         outputUri:       result.outputUri,
         originalUri,
         targetLang,
+        sourceLang,
         mobileData:      null,
         totalMs:         Date.now() - t0,
         translatedCount: 0,
@@ -343,6 +359,7 @@ export class TranslationRouter {
       outputUri:       pcResult.resultUri,
       originalUri,
       targetLang,
+      sourceLang,
       mobileData:      null,   // PC handled rendering; no overlay data needed.
       totalMs:         Date.now() - t0,
       translatedCount: pcResult.translations,

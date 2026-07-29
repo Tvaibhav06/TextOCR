@@ -365,6 +365,47 @@ export async function extractTextFromRegions(
       }
     }
 
+    // M-4: Second-chance match for detections that got no text in the primary pass.
+    // Happens when two adjacent detection bboxes share the same wide ML Kit block and
+    // one wins at IoU ≥ MIN_IOU_OVERLAP while the other scores below the threshold.
+    // Re-scan at a lower threshold (SECOND_CHANCE_IOU) to give the empty detection
+    // a chance to claim any overlapping block. Confidence is penalised 10% to reflect
+    // that the match is weaker.
+    const SECOND_CHANCE_IOU = 0.12;
+    if (!bestRawText) {
+      for (const block of blocks) {
+        const blockFrame = block.frame;
+        if (!blockFrame) continue;
+        const blockRect: Rect = {
+          x:      blockFrame.left   ?? 0,
+          y:      blockFrame.top    ?? 0,
+          width:  blockFrame.width  ?? 0,
+          height: blockFrame.height ?? 0,
+        };
+        const overlap = ioU(detRect, blockRect);
+        if (overlap < SECOND_CHANCE_IOU || overlap <= bestIoU) continue;
+
+        const rawBlockText = (block.lines ?? [])
+          .flatMap((line: any) => line.elements ?? [])
+          .map((el: any) => el.text ?? '')
+          .join(' ')
+          .trim();
+        if (!rawBlockText) continue;
+
+        const mlkitConf = extractBlockConfidence(block);
+        bestIoU       = overlap;
+        bestRawText   = rawBlockText;
+        // 10% confidence penalty for second-chance matches
+        bestMlkitConf = mlkitConf * 0.90;
+        if (block.cornerPoints && block.cornerPoints.length >= 2) {
+          const p0 = block.cornerPoints[0];
+          const p1 = block.cornerPoints[1];
+          bestAngle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+        }
+        console.log(`[MobileOCR] M-4 second-chance match for region ${det.id} at IoU=${overlap.toFixed(2)}`);
+      }
+    }
+
     // ── Clean OCR noise from the best match ──────────────────────────────
     const cleanedText = cleanOcrText(bestRawText);
 

@@ -743,6 +743,7 @@ class TextRenderer:
         Returns:
             A new BGR image with translated text rendered in-place.
             Regions where skip=True or engine='failed' are left erased.
+            Regions where engine='restored' are composited from original pixels.
         """
         output = inpainted_bgr.copy()
         h, w   = output.shape[:2]
@@ -750,6 +751,46 @@ class TextRenderer:
         paired = list(zip(ocr_results, translations))
         log.info("[Stage 7] Rendering %d regions for lang=%s", len(paired), target_lang)
 
+        # ── Pass 1: Selective Restoration ────────────────────────────────────
+        # Composite original pixels for all engine='restored' regions BEFORE
+        # drawing any translated text, so translated paragraphs can sit on top.
+        for ocr, tr in paired:
+            if getattr(tr, 'engine', None) != 'restored':
+                continue
+
+            # Get polygon points if available; fall back to bounding rect
+            points = getattr(ocr, 'points', None)
+            if points is not None and len(points) >= 3:
+                try:
+                    poly_pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+                    poly_pts[:, 0, 0] = np.clip(poly_pts[:, 0, 0], 0, w - 1)
+                    poly_pts[:, 0, 1] = np.clip(poly_pts[:, 0, 1], 0, h - 1)
+                except (ValueError, TypeError):
+                    points = None  # Fall through to bbox
+
+            if points is None or len(points) < 3:
+                # Fallback: rectangular bounding box
+                x  = max(0, min(ocr.x, w - 1))
+                y_ = max(0, min(ocr.y, h - 1))
+                x2 = max(x + 1, min(ocr.x + ocr.w, w))
+                y2 = max(y_ + 1, min(ocr.y + ocr.h, h))
+                poly_pts = np.array([[[x, y_]], [[x2, y_]], [[x2, y2]], [[x, y2]]], dtype=np.int32)
+
+            # Build a grayscale mask matching output size, fill polygon white
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [poly_pts], color=255)
+
+            # Feather the mask with a 1-pixel Gaussian blur to soften the seam
+            mask_f = cv2.GaussianBlur(mask, (3, 3), sigmaX=1.0)
+            mask_3 = mask_f[:, :, np.newaxis].astype(np.float32) / 255.0
+
+            # Alpha-blend original pixels into the output at the masked region
+            output = (mask_3 * original_bgr.astype(np.float32) +
+                      (1.0 - mask_3) * output.astype(np.float32)).astype(np.uint8)
+
+            log.debug("[Stage 7] Region %s: restored from original pixels", getattr(ocr, 'det_id', '?'))
+
+        # ── Pass 2: Translated text rendering ────────────────────────────────
         for ocr, tr in paired:
             # Hard skip: region was explicitly flagged as no-text by OCR
             if ocr.skip:
@@ -764,6 +805,10 @@ class TextRenderer:
                     cv2.rectangle(output, (x, y_), (x2 - 1, y2 - 1),
                                   color=(180, 180, 180), thickness=1)
                 log.debug("[Stage 7] Region %d: OCR skip — left erased", ocr.det_id)
+                continue
+
+            # Skip restored regions — already handled in Pass 1
+            if getattr(tr, 'engine', None) == 'restored':
                 continue
 
             # Choose render text:
@@ -787,6 +832,35 @@ class TextRenderer:
             orig_crop = original_bgr[y:y2, x:x2]
             inp_crop  = inpainted_bgr[y:y2, x:x2]
 
+            # R7-8: Pre-render font-coverage guard.
+            # If FontSelector falls back to the universal Latin font (NotoSans-Regular.ttf)
+            # for a non-Latin script, the font has no glyphs for the target language and
+            # rendering will produce tofu boxes. Tofu is worse than a clean inpainted blank.
+            # In that case, skip this region — the inpainted background is the correct output.
+            try:
+                _guard_font, _guard_level = self._selector.select(
+                    # Use a minimal FontAttrs-like probe — we only care about the fallback level.
+                    type('_FA', (), {
+                        'font_class': type('_FC', (), {'value': 'sans_serif'})(),
+                        'weight':     type('_FW', (), {'value': 'regular'})(),
+                    })(),
+                    render_text,
+                    target_lang,
+                )
+                if _guard_level == 2:
+                    # Level 2 = universal NotoSans-Regular fallback = no script font available.
+                    detected_script = _detect_script_from_text(render_text)
+                    if detected_script != 'latin':
+                        log.warning(
+                            "[Stage 7] R7-8: No %r font installed for region %d (script=%r) "
+                            "— leaving inpainted to avoid tofu. "
+                            "Run python scripts/download_fonts.py to install missing fonts.",
+                            target_lang, ocr.det_id, detected_script,
+                        )
+                        continue  # skip region; leave clean inpainted background
+            except Exception as _guard_err:
+                log.debug("[Stage 7] R7-8 font guard probe failed: %s — proceeding with render.", _guard_err)
+
             try:
                 attrs = self._extractor.extract(
                     orig_crop, inp_crop,
@@ -805,6 +879,7 @@ class TextRenderer:
 
         log.info("[Stage 7] Rendering complete.")
         return output
+
 
     # ── Utility: Color Math ───────────────────────────────────────────────────
 
@@ -890,8 +965,11 @@ class TextRenderer:
         is_cjk = target_lang.lower() in ("zh", "ja", "ko")
 
         # ── Step 1 & 2 & 3: Binary search for best effective size ─────────────
+        lang_prefix = target_lang.split('-')[0].lower()
+        cap_ratio = _CAP_RATIOS.get(lang_prefix, _CAP_RATIOS["default"])
+        
         low = 6
-        high = max(6, attrs.size_px)
+        high = max(6, int(attrs.size_px / cap_ratio))
         best_size = low
         best_lines = []
 
@@ -902,7 +980,7 @@ class TextRenderer:
             except Exception:
                 test_lines = [text]
             
-            line_height = max(8, int(mid * 1.2))
+            line_height = max(8, int(mid / cap_ratio))
             total_h = len(test_lines) * line_height
             
             # Verify if longest line fits in width (wrap_text forces long words onto one line)
@@ -926,7 +1004,7 @@ class TextRenderer:
 
         effective_size = best_size
         lines = best_lines if best_lines else self._wrap_text(text, font_path, effective_size, layer_w, is_cjk)
-        line_height = max(8, int(effective_size * 1.2))
+        line_height = max(8, int(effective_size / cap_ratio))
 
         # ── Step 4: Vertically center text block ──────────────────────────────
         total_h = len(lines) * line_height
@@ -1022,7 +1100,8 @@ class TextRenderer:
             ], dtype=np.float32)
             
             # Shift pts to be relative to x, y crop
-            pts_shifted = pts - [x, y]
+            # Cast back to float32 because subtracting a list of ints promotes to float64
+            pts_shifted = (pts - [x, y]).astype(np.float32)
             
             M = cv2.getPerspectiveTransform(src_pts, pts_shifted)
             warped_layer = cv2.warpPerspective(

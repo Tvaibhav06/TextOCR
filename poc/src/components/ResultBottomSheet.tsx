@@ -28,6 +28,9 @@ interface ResultBottomSheetProps {
   translationStage?: string;
   targetLang?: string;
   onTargetLangChange?: (lang: string) => void;
+  /** Source language filter selector. */
+  sourceLang?: string;
+  onSourceLangChange?: (lang: string) => void;
   /** Set after a translation completes — drives the translation status banner. */
   translationSession?: TranslationSession | null;
   /** Stage 7 mobile render coverage: 0–1. null = not yet rendered. */
@@ -54,12 +57,15 @@ export function ResultBottomSheet({
   translationStage,
   targetLang,
   onTargetLangChange,
+  sourceLang = 'auto',
+  onSourceLangChange,
   translationSession,
   renderCoverage,
   isSaveReady = true,
 }: ResultBottomSheetProps) {
   const [showTimings, setShowTimings] = useState(false);
   const [showLangPicker, setShowLangPicker] = useState(false);
+  const [showSrcLangPicker, setShowSrcLangPicker] = useState(false);
 
   const { quality, backend, timing, detections } = result;
 
@@ -189,6 +195,18 @@ export function ResultBottomSheet({
       <View style={styles.actionColumn}>
         {FEATURES.TRANSLATION_ENABLED && onTranslate && targetLang && onTargetLangChange && (
           <View style={styles.actionRow}>
+            {/* Source Language Selector */}
+            <Pressable
+              style={[styles.langSelectorBtn, styles.langSelectorBtnSrc]}
+              onPress={() => setShowSrcLangPicker(true)}
+            >
+              <Text style={styles.langSelectorText}>
+                {sourceLang === 'auto'
+                  ? 'Auto ▼'
+                  : `${AVAILABLE_LANGUAGES.find(l => l.code === sourceLang)?.name || sourceLang} ▼`}
+              </Text>
+            </Pressable>
+            {/* Destination Language Selector */}
             <Pressable 
               style={styles.langSelectorBtn} 
               onPress={() => setShowLangPicker(true)}
@@ -219,11 +237,11 @@ export function ResultBottomSheet({
         </View>
       </View>
 
-      {/* Language Picker Modal */}
+      {/* Language Picker Modal — Destination */}
       <Modal visible={showLangPicker} transparent animationType="fade">
         <Pressable style={styles.modalBackdrop} onPress={() => setShowLangPicker(false)}>
           <View style={styles.pickerContainer}>
-            <Text style={styles.pickerTitle}>Select Language</Text>
+            <Text style={styles.pickerTitle}>Destination Language</Text>
             <ScrollView style={styles.pickerScroll}>
               {AVAILABLE_LANGUAGES.map(lang => (
                 <TouchableOpacity 
@@ -241,6 +259,46 @@ export function ResultBottomSheet({
               ))}
             </ScrollView>
             <TouchableOpacity style={styles.pickerCloseBtn} onPress={() => setShowLangPicker(false)}>
+              <Text style={styles.pickerCloseText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </Pressable>
+      </Modal>
+
+      {/* Source Language Picker Modal */}
+      <Modal visible={showSrcLangPicker} transparent animationType="fade">
+        <Pressable style={styles.modalBackdrop} onPress={() => setShowSrcLangPicker(false)}>
+          <View style={styles.pickerContainer}>
+            <Text style={styles.pickerTitle}>Source Language</Text>
+            <ScrollView style={styles.pickerScroll}>
+              {/* Auto option (first) */}
+              <TouchableOpacity
+                style={[styles.pickerItem, sourceLang === 'auto' && styles.pickerItemActive]}
+                onPress={() => {
+                  onSourceLangChange?.('auto');
+                  setShowSrcLangPicker(false);
+                }}
+              >
+                <Text style={[styles.pickerItemText, sourceLang === 'auto' && styles.pickerItemTextActive]}>
+                  Auto (Detect All)
+                </Text>
+              </TouchableOpacity>
+              {AVAILABLE_LANGUAGES.map(lang => (
+                <TouchableOpacity
+                  key={lang.code}
+                  style={[styles.pickerItem, sourceLang === lang.code && styles.pickerItemActive]}
+                  onPress={() => {
+                    onSourceLangChange?.(lang.code);
+                    setShowSrcLangPicker(false);
+                  }}
+                >
+                  <Text style={[styles.pickerItemText, sourceLang === lang.code && styles.pickerItemTextActive]}>
+                    {lang.name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <TouchableOpacity style={styles.pickerCloseBtn} onPress={() => setShowSrcLangPicker(false)}>
               <Text style={styles.pickerCloseText}>Cancel</Text>
             </TouchableOpacity>
           </View>
@@ -436,6 +494,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     flex: 1,
+  },
+  langSelectorBtnSrc: {
+    // Source selector gets a slightly different tint to visually separate it
+    // from the destination selector.
+    backgroundColor: 'rgba(26,115,232,0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(26,115,232,0.25)',
   },
   langSelectorText: {
     ...Theme.typography.button,

@@ -105,37 +105,51 @@ def _mser_second_pass(
 def _probe_source_lang(image_bgr: np.ndarray, detections: list, max_samples: int = 3) -> str:
     """
     Sample up to `max_samples` detection crops from the original image and run
-    script-block detection to get a source language hint for Stage 5 OCR.
+    the existing English PaddleOCR recognizer + TranslationRouter._identify_language()
+    to get a source language hint for Stage 5 OCR.
+
+    Strategy (P-3):
+    1. Reuse get_ocr() (the existing Stage 5 engine, already warmed if Stage 1–4 ran).
+    2. Run recognition with source_lang_hint='und' (→ English/Latin recognizer) on a few crops.
+    3. Concatenate the recognized text and call TranslationRouter._identify_language().
+    4. Return the detected BCP-47 code, or 'und' if detection disagrees or fails.
+
+    This is reliable for CJK and Devanagari: even when the English recognizer returns
+    imperfect glyphs for non-Latin scripts, langdetect can still detect the dominant
+    script from the partial output.
+
+    No new dependencies: reuses PaddleOCR (already imported) and
+    TranslationRouter._identify_language (already a @staticmethod in translation.py).
 
     Returns an ISO language code string (e.g. 'en', 'hi', 'zh') or 'und' if
     no dominant script is found.
     """
-    from pipeline.translation import TranslationRouter
-    from pipeline.ocr import _crop_deskew
-    import numpy as np
-
-    votes: dict[str, int] = {}
-    for det in detections[:max_samples]:
-        poly = np.array(det.polygon, dtype=np.float32)
-        crop = _crop_deskew(image_bgr, poly)
-        if crop is None or crop.size == 0:
-            continue
-        # Convert crop to a rough text sample for script detection.
-        # We don't need real OCR here — just the Unicode script range probe.
-        # Since this is a pixel crop (not text), we can't directly detect script;
-        # instead we'll rely on the crop's pixel characteristics being meaningful
-        # only when we have actual text content from later stages.
-        # For now, use the lang from the bounding box source attribute as a hint.
-        # If source is 'paddleocr', the detection is reliable; use 'und' for MSER.
-        if getattr(det, 'source', '') in ('paddleocr', 'injected'):
-            # Attempt to get script hint from detection confidence range
-            # (high-conf PaddleOCR tends to be Latin/CJK based on model)
-            pass  # will use 'und' and rely on individual OCR results
-
-    # If we have no reliable votes, return 'und' — ocr.py will default to 'en'
-    if not votes:
+    if not detections:
         return "und"
-    return max(votes, key=lambda k: votes[k])
+
+    try:
+        from pipeline.translation import TranslationRouter
+        from pipeline.ocr import _crop_deskew
+
+        ocr_engine = get_ocr()
+
+        # Run the public API on a 2-crop sample (loads English model if not yet loaded).
+        sample_dets = detections[:max_samples]
+        partial_results = ocr_engine.run(image_bgr, sample_dets, source_lang_hint="und")
+
+        texts = [r.text.strip() for r in partial_results if r.text and r.text.strip()]
+        if not texts:
+            return "und"
+
+        combined = " ".join(texts)
+        detected = TranslationRouter._identify_language(combined)
+        log.info("[Stage 5] P-3 source probe: sample=%r → lang=%r", combined[:60], detected)
+        return detected if detected else "und"
+
+    except Exception as e:
+        log.warning("[Stage 5] P-3 source probe failed: %s — using 'und'", e)
+        return "und"
+
 
 
 # ── Startup checks ────────────────────────────────────────────────────────────
@@ -450,6 +464,7 @@ def process_image(image: UploadFile = File(...)):
 def process_translate_image(
     image: UploadFile = File(...),
     target_lang: str = Form("en"),
+    source_lang: str = Form("auto"),
     regions_json: str = Form(None),
 ):
     """
@@ -459,7 +474,9 @@ def process_translate_image(
       1. Stages 1-4: PaddleOCR detection + LaMa inpainting.
       2. Stage 5:    Tesseract OCR on detected regions from original image.
       3. Stage 6:    IndicTrans2 / Argos Translate to target_lang.
-      4. Stage 7:    TextRenderer overlay with matched fonts & BiDi.
+                     If source_lang != 'auto', only regions matching that language
+                     are translated; others are marked engine='restored' for Stage 7.
+      4. Stage 7:    TextRenderer overlay + Selective Restoration for engine='restored' regions.
     """
     log.info(
         "Process-Translate request: file=%r target_lang=%r",
@@ -523,21 +540,37 @@ def process_translate_image(
                     
                     text = r.get("text", "")
                     skip_flag = r.get("skip", False)
+                    # SR-1: Extract polygon points for renderer.py Stage 7 clip accuracy.
+                    # If poly_list was parsed above, convert to list-of-tuples; otherwise
+                    # fall back to the four bbox corners (same shape as the rect fallback).
+                    if poly_list and isinstance(poly_list, list) and len(poly_list) >= 3:
+                        ocr_points = [(float(p[0]), float(p[1])) for p in poly_list]
+                    else:
+                        ocr_points = [
+                            (float(x), float(y)),
+                            (float(x + w), float(y)),
+                            (float(x + w), float(y + h)),
+                            (float(x), float(y + h)),
+                        ]
                     if text and isinstance(text, str) and text.strip():
+                        ocr_obj = OcrResult(
+                            det_id=r_id, text=text, confidence=conf,
+                            skip=skip_flag, x=x, y=y, w=w, h=h
+                        )
+                        ocr_obj.points = ocr_points
                         valid_ocr.append({
                             "has_text": True,
-                            "obj": OcrResult(
-                                det_id=r_id, text=text, confidence=conf,
-                                skip=skip_flag, x=x, y=y, w=w, h=h
-                            )
+                            "obj": ocr_obj
                         })
                     else:
+                        ocr_obj = OcrResult(
+                            det_id=r_id, text="", confidence=conf,
+                            skip=True, x=x, y=y, w=w, h=h
+                        )
+                        ocr_obj.points = ocr_points
                         valid_ocr.append({
                             "has_text": False,
-                            "obj": OcrResult(
-                                det_id=r_id, text="", confidence=conf,
-                                skip=True, x=x, y=y, w=w, h=h
-                            )
+                            "obj": ocr_obj
                         })
                 
                 injected_detections = valid_detections
@@ -614,8 +647,9 @@ def process_translate_image(
                         ocr_obj = inj["obj"]
                         # Tag with stable source lang so Stage 6 avoids running langdetect
                         # on noisy handwriting OCR text (which causes misidentification).
-                        # Mobile MLKit reads the source text reliably; default to 'en'.
-                        ocr_obj._injected_src_lang = str(inj.get("src_lang", "en") or "en")
+                        # If Mobile MLKit doesn't provide a language, default to 'und' so we
+                        # don't blindly translate everything when a source filter is active.
+                        ocr_obj._injected_src_lang = str(inj.get("src_lang", "und") or "und")
                         ocr_results.append(ocr_obj)
                     else:
                         # Attempt to derive source script from mobile text (if any), else 'und'
@@ -637,7 +671,7 @@ def process_translate_image(
                     img_bgr, result.detections, source_lang_hint=source_lang_hint
                 )
             
-            # ── Stage 6: Translate
+            # ── Stage 6: Translate (with optional Selective Restoration filter) ──
             translator = get_translator()
             # Preflight: log missing model warnings for this request's language pair
             translator.preflight(src="auto", tgt=target_lang)
@@ -645,15 +679,43 @@ def process_translate_image(
             tr_results = []
             for r in ocr_results:
                 if r.skip:
-                    tr_results.append(TranslationResult(
-                        text=r.text, engine="skipped", src_lang="auto", tgt_lang=target_lang
-                    ))
+                    if source_lang != "auto":
+                        # When a source filter is active, skip=True regions are also
+                        # marked 'restored' so they aren't left as blank erased holes.
+                        tr_results.append(TranslationResult(
+                            text=r.text, engine="restored", src_lang="auto", tgt_lang=target_lang
+                        ))
+                    else:
+                        tr_results.append(TranslationResult(
+                            text=r.text, engine="skipped", src_lang="auto", tgt_lang=target_lang
+                        ))
                 else:
                     # Use the injected src_lang if the mobile path set it on the OcrResult.
-                    # This avoids running langdetect on noisy handwriting OCR text (typos,
-                    # dropped chars cause misidentification → wrong Argos pair → engine='failed').
+                    # This avoids running langdetect on noisy handwriting OCR text.
                     injected_src = getattr(r, "_injected_src_lang", None)
                     src_hint = injected_src if injected_src else "auto"
+
+                    # ── Selective Restoration filter ──────────────────────────
+                    # If source_lang is explicitly set, identify the region's language
+                    # and mark it 'restored' if it doesn't match the filter.
+                    if source_lang != "auto":
+                        from pipeline.translation import TranslationRouter as _TR
+                        detected_region_lang = src_hint if src_hint not in ("auto", "und") else \
+                            _TR._identify_language(r.text)
+                        
+                        # Policy: If language cannot be detected confidently (e.g., 'und'),
+                        # do not guess blindly. Treat it as a mismatch to restore original text.
+                        if detected_region_lang == "und" or detected_region_lang.lower() != source_lang.lower():
+                            log.info(
+                                "[Stage 6] Region %s lang=%r ≠ source_filter=%r → restored",
+                                getattr(r, 'det_id', '?'), detected_region_lang, source_lang
+                            )
+                            tr_results.append(TranslationResult(
+                                text=r.text, engine="restored",
+                                src_lang=detected_region_lang, tgt_lang=target_lang
+                            ))
+                            continue
+
                     res = translator.translate(r.text, src=src_hint, tgt=target_lang)
                     tr_results.append(res)
 

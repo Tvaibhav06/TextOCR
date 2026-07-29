@@ -378,6 +378,7 @@ class BackendService {
     origHeight:       number = 0,
     existingDetections?: any[],
     existingOcrResults?: any[],
+    sourceLang:       string = 'auto',
   ): Promise<{
     resultUri:       string;
     totalMs:         number;
@@ -421,6 +422,10 @@ class BackendService {
       type: 'image/jpeg',
     } as any);
     formData.append('target_lang', targetLang);
+    // Append source_lang filter. 'auto' tells the server to translate all regions
+    // (existing behavior). An explicit BCP-47 code tells the server to only translate
+    // regions that match that language and restore the rest from the original image.
+    formData.append('source_lang', sourceLang);
 
     if (existingDetections && existingDetections.length > 0) {
       try {
