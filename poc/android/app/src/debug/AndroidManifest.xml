@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+
+    <!-- usesCleartextTraffic and networkSecurityConfig are now set in the
+         main AndroidManifest.xml. No override needed here. -->
+
+</manifest>

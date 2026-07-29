@@ -175,7 +175,9 @@ log()
 log("  Timing breakdown:")
 stage_keys = [k for k in result.timing if k != 'total_ms']
 for k in stage_keys:
-    ms  = result.timing[k]
+    ms = result.timing[k]
+    if k == 'total_ms' or not isinstance(ms, (int, float)):
+        continue
     bar = '|' * max(1, int(ms / 15))
     log(f"    {k:<18} {ms:>7.1f} ms  {bar}")
 log(f"    {'TOTAL':<18} {result.timing['total_ms']:>7.1f} ms")

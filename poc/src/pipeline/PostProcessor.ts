@@ -3,16 +3,18 @@
  *
  * Two operations:
  *
- *  A. Poisson Blending (expo-gl / WebGL)
- *     Smooths hard colour discontinuities at mask boundary.
- *     Solves:  ∇²f = div(v)  inside Ω,  f = f*  on ∂Ω
- *     Where:  v = gradient of source (inpainted region)
- *             f* = target pixel values (original image)
- *     Implemented as iterative Jacobi on GPU via WebGL fragment shader.
- *     K iterations of:  f_new(p) = (f*(N,E,S,W) + rhs(p)) / 4
- *     where rhs encodes the divergence of the guidance field.
+ *  A. Native Edge Blending  (OpenCV C++ via JSI — NativeModules.OpenCVProcessor)
+ *     Smooths hard colour discontinuities at the mask boundary.
+ *     Replaces the old expo-gl / WebGL Jacobi Poisson solver.
  *
- *  B. Quality Assessment
+ *     On the native side (Android JNI / iOS Obj-C++):
+ *       cv::seamlessClone()  or  cv::inpaint() second-pass edge feather
+ *     Returns the blended image URI written to temp storage.
+ *
+ *     For the Track 2 POC the native module returns the input URI unchanged
+ *     (stub). Wired to real cv::seamlessClone in Track 3.
+ *
+ *  B. Quality Assessment  (pure TypeScript — no native dependency)
  *     Computes SSIM and PSNR on the masked region to decide
  *     whether to offer the user a "request higher quality" button
  *     that triggers the server-side LaMa pipeline.
@@ -21,15 +23,34 @@
  *     PSNR      = 10·log₁₀(255²/MSE)
  */
 
-import { GLView } from 'expo-gl';
-import type { ExpoWebGLRenderingContext } from 'expo-gl';
+import { NativeModules } from 'react-native';
 import type { MaskResult } from './MaskGenerator';
+
+// ─── Hermes-safe base64 encoder ───────────────────────────────────────────────
+// btoa() is a browser Web API — it does NOT exist in Hermes on React Native
+// 0.73.x. This pure-JS implementation works on any JS engine.
+const BASE64_CHARS =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function toBase64(bytes: Uint8Array): string {
+  let result = '';
+  const len = bytes.length;
+  for (let i = 0; i < len; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < len ? bytes[i + 1] : 0;
+    const b2 = i + 2 < len ? bytes[i + 2] : 0;
+    result += BASE64_CHARS[b0 >> 2];
+    result += BASE64_CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+    result += i + 1 < len ? BASE64_CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] : '=';
+    result += i + 2 < len ? BASE64_CHARS[b2 & 0x3f] : '=';
+  }
+  return result;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface PostProcessConfig {
-  enablePoisson: boolean;     // default true
-  poissonIterations: number;  // default 50 (GPU Jacobi steps)
+  enableBlend: boolean;       // default true — run native edge blend
   qualityThreshold: number;   // SSIM below this → prompt server upgrade, default 0.82
 }
 
@@ -43,207 +64,98 @@ export interface QualityMetrics {
 export interface PostProcessResult {
   outputUri:    string;
   quality:      QualityMetrics;
-  poissonApplied: boolean;
+  blendApplied: boolean;
   processingMs: number;
 }
 
 const DEFAULT_POST_CONFIG: PostProcessConfig = {
-  enablePoisson: true,
-  poissonIterations: 50,
+  enableBlend: true,
   qualityThreshold: 0.82,
 };
 
-// ─── WebGL Poisson Blending ───────────────────────────────────────────────────
-
-/** GLSL vertex shader — full-screen quad */
-const VERT_SRC = `
-  attribute vec2 a_pos;
-  varying   vec2 v_uv;
-  void main() {
-    v_uv        = a_pos * 0.5 + 0.5;
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-  }
-`;
+// ─── Native Image Processor Bridge ───────────────────────────────────────────
 
 /**
- * GLSL fragment shader — one Jacobi iteration of Poisson solve.
+ * NativeImageProcessor bridges to the OpenCVProcessor TurboModule (C++ JSI).
  *
- * f_new(p) = [ f(N) + f(E) + f(S) + f(W)
- *              + rhs(p)    ← divergence of guidance field v
- *            ] / 4
+ * Native module interface (Android: JNI / iOS: Obj-C++):
+ *   processImage(imageUri, maskBase64, { method, radius }) → Promise<string>
+ *     - method: 'blend' | 'dilate' | 'inpaint_telea' | 'inpaint_ns'
+ *     - Returns output file URI (written to app temp dir)
  *
- * Boundary condition: where mask = 0, f stays locked to target (original).
+ * For Track 2 (stub): the native module returns the input URI unchanged.
+ * Real OpenCV operations will be wired in Track 3 (pipeline wiring sprint).
+ *
+ * Docs:
+ *   Android: src/native/OpenCVProcessor.cpp + CMakeLists.txt
+ *   iOS:     src/native/ios/OpenCVProcessor.mm
  */
-const FRAG_POISSON = `
-  precision mediump float;
+export class NativeImageProcessor {
+  /** NativeModules.OpenCVProcessor — registered by the C++ TurboModule. */
+  private module = NativeModules.OpenCVProcessor;
 
-  uniform sampler2D u_current;    // current iterate f
-  uniform sampler2D u_target;     // original image f*
-  uniform sampler2D u_source;     // inpainted image g
-  uniform sampler2D u_mask;       // binary mask (r=1 inside Ω)
-  uniform vec2      u_texel;      // 1/width, 1/height
-
-  varying vec2 v_uv;
-
-  void main() {
-    float inside = texture2D(u_mask, v_uv).r;
-
-    if (inside < 0.5) {
-      // Outside mask: lock to original
-      gl_FragColor = texture2D(u_target, v_uv);
-      return;
-    }
-
-    // Sample 4-neighbour current iterate
-    vec4 fN = texture2D(u_current, v_uv + vec2( 0.0,  u_texel.y));
-    vec4 fE = texture2D(u_current, v_uv + vec2( u_texel.x,  0.0));
-    vec4 fS = texture2D(u_current, v_uv + vec2( 0.0, -u_texel.y));
-    vec4 fW = texture2D(u_current, v_uv + vec2(-u_texel.x,  0.0));
-
-    // Guidance field divergence: div(∇g) ≈ g(N)+g(E)+g(S)+g(W) - 4g(p)
-    vec4 gC = texture2D(u_source, v_uv);
-    vec4 gN = texture2D(u_source, v_uv + vec2( 0.0,  u_texel.y));
-    vec4 gE = texture2D(u_source, v_uv + vec2( u_texel.x,  0.0));
-    vec4 gS = texture2D(u_source, v_uv + vec2( 0.0, -u_texel.y));
-    vec4 gW = texture2D(u_source, v_uv + vec2(-u_texel.x,  0.0));
-    vec4 rhs = gN + gE + gS + gW - 4.0 * gC;
-
-    // Jacobi update
-    gl_FragColor = (fN + fE + fS + fW + rhs) / 4.0;
-  }
-`;
-
-export class PoissonBlender {
-  private gl: ExpoWebGLRenderingContext | null = null;
-
-  setGL(gl: ExpoWebGLRenderingContext) {
-    this.gl = gl;
+  /** True if the native module is installed and callable. */
+  isAvailable(): boolean {
+    return typeof this.module?.processImage === 'function';
   }
 
   /**
-   * Run Poisson blending entirely on GPU.
-   * Returns updated pixel buffer.
+   * Edge-blend the inpainted image against the original at mask boundaries.
+   *
+   * Native path: cv::seamlessClone (NORMAL_CLONE mode) over the mask region.
+   * JS fallback: returns inpaintedUri unchanged (no-op blend).
+   *
+   * @param originalUri  - Local file URI of the original image
+   * @param inpaintedUri - Local file URI of the inpainted image
+   * @param maskBase64   - Base64-encoded single-channel PNG mask (255=text region)
+   * @returns            - Local file URI of the blended output
    */
-  blend(
-    originalPixels: Uint8Array,
-    inpaintedPixels: Uint8Array,
-    mask: MaskResult,
-    iterations: number,
-  ): Uint8Array {
-    const gl = this.gl;
-    if (!gl) {
-      console.warn('[Poisson] No GL context — skipping blend');
-      return inpaintedPixels;
+  async blend(
+    originalUri: string,
+    inpaintedUri: string,
+    maskBase64: string,
+  ): Promise<string> {
+    if (!this.isAvailable()) {
+      console.warn('[NativeImageProcessor] OpenCVProcessor not available — skipping blend');
+      return inpaintedUri;
     }
 
-    const { width: W, height: H } = mask;
-
-    // Compile shaders
-    const prog = this.compileProgram(gl, VERT_SRC, FRAG_POISSON);
-    if (!prog) return inpaintedPixels;
-
-    // Upload textures
-    const texTarget   = this.uploadTexture(gl, originalPixels,  W, H);
-    const texSource   = this.uploadTexture(gl, inpaintedPixels, W, H);
-    const texMask     = this.uploadTexture(gl, this.expandMask(mask.data, W, H), W, H);
-    let   texCurrent  = this.uploadTexture(gl, inpaintedPixels, W, H);
-
-    // Two framebuffer ping-pong
-    const [fbo0, tex0] = this.makeFramebuffer(gl, W, H);
-    const [fbo1, tex1] = this.makeFramebuffer(gl, W, H);
-
-    // Full-screen quad
-    const quadBuf = gl.createBuffer()!;
-    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-
-    gl.useProgram(prog);
-    gl.viewport(0, 0, W, H);
-
-    const bindTex = (unit: number, tex: WebGLTexture, name: string) => {
-      gl.activeTexture(gl.TEXTURE0 + unit);
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.uniform1i(gl.getUniformLocation(prog, name)!, unit);
-    };
-
-    gl.uniform2f(gl.getUniformLocation(prog, 'u_texel')!, 1 / W, 1 / H);
-
-    const posLoc = gl.getAttribLocation(prog, 'a_pos');
-    gl.enableVertexAttribArray(posLoc);
-    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-
-    // Jacobi iterations (ping-pong between fbo0 and fbo1)
-    let readTex  = texCurrent;
-    let writeFBO = fbo0;
-    let writeTex = tex0;
-
-    for (let i = 0; i < iterations; i++) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, writeFBO);
-      bindTex(0, readTex,   'u_current');
-      bindTex(1, texTarget, 'u_target');
-      bindTex(2, texSource, 'u_source');
-      bindTex(3, texMask,   'u_mask');
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-      // Swap
-      [readTex, writeTex] = [writeTex, readTex];
-      writeFBO = writeFBO === fbo0 ? fbo1 : fbo0;
+    try {
+      const outputUri: string = await this.module.processImage(
+        inpaintedUri,
+        maskBase64,
+        {
+          method: 'blend',
+          originalUri,
+        },
+      );
+      return outputUri;
+    } catch (err) {
+      console.warn('[NativeImageProcessor] blend failed, returning inpainted URI:', err);
+      return inpaintedUri;
     }
-
-    // Read back result
-    const result = new Uint8Array(W * H * 4);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, writeFBO === fbo0 ? fbo1 : fbo0);
-    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, result);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    return result;
   }
 
-  private compileProgram(gl: ExpoWebGLRenderingContext, vert: string, frag: string): WebGLProgram | null {
-    const vs = gl.createShader(gl.VERTEX_SHADER)!;
-    gl.shaderSource(vs, vert); gl.compileShader(vs);
-    const fs = gl.createShader(gl.FRAGMENT_SHADER)!;
-    gl.shaderSource(fs, frag); gl.compileShader(fs);
-    const prog = gl.createProgram()!;
-    gl.attachShader(prog, vs); gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      console.error('[Poisson] Shader link error:', gl.getProgramInfoLog(prog));
-      return null;
+  /**
+   * Encode single-channel mask as base64 for native bridge.
+   * Uses the module-level toBase64() helper — btoa() is NOT available
+   * in Hermes on React Native 0.73.x.
+   */
+  maskToBase64(mask: MaskResult): string {
+    // Expand 1-channel mask to RGBA for PNG encoding compatibility
+    const rgba = new Uint8Array(mask.width * mask.height * 4);
+    for (let i = 0; i < mask.width * mask.height; i++) {
+      const v = mask.data[i];
+      rgba[i * 4]     = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
     }
-    return prog;
-  }
-
-  private uploadTexture(gl: ExpoWebGLRenderingContext, data: Uint8Array, w: number, h: number): WebGLTexture {
-    const tex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
-    return tex;
-  }
-
-  private makeFramebuffer(gl: ExpoWebGLRenderingContext, w: number, h: number): [WebGLFramebuffer, WebGLTexture] {
-    const tex = this.uploadTexture(gl, new Uint8Array(w * h * 4), w, h);
-    const fbo = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return [fbo, tex];
-  }
-
-  private expandMask(mask: Uint8Array, w: number, h: number): Uint8Array {
-    const rgba = new Uint8Array(w * h * 4);
-    for (let i = 0; i < w * h; i++) {
-      const v = mask[i] > 0 ? 255 : 0;
-      rgba[i*4] = v; rgba[i*4+1] = v; rgba[i*4+2] = v; rgba[i*4+3] = 255;
-    }
-    return rgba;
+    return toBase64(rgba);
   }
 }
 
-// ─── Quality Metrics ──────────────────────────────────────────────────────────
+// ─── Quality Metrics (pure JS) ────────────────────────────────────────────────
 
 export class QualityAssessor {
   /**
@@ -258,7 +170,6 @@ export class QualityAssessor {
     mask:     MaskResult,
     threshold: number,
   ): QualityMetrics {
-    const W = mask.width;
     const N = mask.width * mask.height;
 
     let sumA = 0, sumB = 0, sumA2 = 0, sumB2 = 0, sumAB = 0, mse = 0;
@@ -303,5 +214,72 @@ export class QualityAssessor {
   }
 }
 
-export const poissonBlender = new PoissonBlender();
-export const qualityAssessor = new QualityAssessor();
+// ─── Singletons ───────────────────────────────────────────────────────────────
+
+/**
+ * @deprecated PoissonBlender removed — WebGL expo-gl dependency eliminated.
+ *             Use nativeImageProcessor.blend() instead.
+ */
+export const poissonBlender = {
+  blend: () => {
+    throw new Error(
+      '[PostProcessor] PoissonBlender removed. Use nativeImageProcessor.blend() via NativeModules.OpenCVProcessor.',
+    );
+  },
+  setGL: () => {},
+};
+
+export const nativeImageProcessor = new NativeImageProcessor();
+export const qualityAssessor       = new QualityAssessor();
+
+// ─── Pixel Extraction (Skia) ──────────────────────────────────────────────────
+
+import { Skia, ColorType, AlphaType, PaintStyle } from '@shopify/react-native-skia';
+
+/**
+ * Extracts raw RGBA pixels from a local image URI using an offscreen Skia surface.
+ * This solves the POC limitation and allows real SSIM math.
+ */
+export async function getImagePixels(uri: string, width: number, height: number): Promise<Uint8Array | null> {
+  try {
+    const data = await Skia.Data.fromURI(uri);
+    const img = Skia.Image.MakeImageFromEncoded(data);
+    if (!img) {
+      console.warn('[PostProcessor] Skia failed to decode image data');
+      return null;
+    }
+
+    const surface = Skia.Surface.Make(width, height);
+    if (!surface) {
+      console.warn('[PostProcessor] Skia failed to create offscreen surface');
+      return null;
+    }
+
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+    paint.setStyle(PaintStyle.Fill);
+
+    // Draw the image scaled to the target dimensions
+    canvas.drawImageRect(
+      img,
+      { x: 0, y: 0, width: img.width(), height: img.height() },
+      { x: 0, y: 0, width, height },
+      paint
+    );
+    surface.flush();
+
+    const snapshot = surface.makeImageSnapshot();
+    const pixels = snapshot.readPixels(0, 0, {
+      width,
+      height,
+      colorType: ColorType.RGBA_8888,
+      alphaType: 1, // Opaque
+    });
+
+    return pixels ? new Uint8Array(pixels) : null;
+  } catch (err) {
+    console.warn('[PostProcessor] getImagePixels failed:', err);
+    return null;
+  }
+}
+

@@ -1,9 +1,58 @@
-# Python backend dependencies — POC
+# Python backend dependencies — Phase 1 (Track 1: Library Update)
 # Install:  pip install -r python-backend/requirements.txt
+#
+# Change log (Phase 1):
+#   - REMOVED:  easyocr  (CRAFT-based, slower, less accurate on complex scenes)
+#   - ADDED:    paddlepaddle + paddleocr  (DBNet++ det + PP-OCRv4 rec, Apache-2.0)
+#   - ADDED:    simple-lama-inpainting   (LaMa Fourier-conv inpainting, premium tier)
 
+# ── Core image processing ────────────────────────────────────────────────────
 opencv-python>=4.9
 numpy>=1.26
 
-# Testing
+# ── Stage 1: Text Detection (replaces easyocr) ───────────────────────────────
+# PaddlePaddle CPU-only build (~60 MB). Switch to paddlepaddle-gpu for CUDA.
+# Pinned strictly to avoid Paddle 3.0 (PIR crashes on Windows) and newer
+# paddleocr versions that enforce paddlex (which requires Paddle 3.0).
+paddlepaddle==2.6.2
+paddleocr==2.7.0.3
+
+# ── Stage 3: Inpainting — Premium server tier (LaMa) ────────────────────────
+simple-lama-inpainting>=0.1.2
+# NOTE: simple-lama-inpainting requires Pillow<10.0.0,>=9.5.0.
+# Lock Pillow here to prevent pip from upgrading it above 9.x.
+# scikit-image on this machine wants Pillow>=10.1 but scikit-image
+# is NOT used anywhere in this backend — the conflict is safe to ignore.
+Pillow==9.5.0
+# torch 2.11.0 was a broken nightly build (shm.dll crash on Windows).
+# Pin to latest stable CPU build. torchvision must match exactly.
+torch==2.5.1
+torchvision==0.20.1
+
+# ── Phase 2: API server ───────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # required for FastAPI UploadFile / multipart form-data
+
+# ── Phase 2: mDNS advertisement (optional) ────────────────────────────────────
+# Allows the mobile app to discover this server automatically on the LAN.
+# The server runs fine without this — mobile manual URL or emulator mode still work.
+zeroconf>=0.132.2
+
+# ── Testing ──────────────────────────────────────────────────────────────────
 pytest>=8.0
 pytest-benchmark>=4.0   # optional: for benchmarking pipeline stages
+
+# ── Phase 3 / Stage 7: Font Matching & Re-Render (PC path) ───────────────────
+# Text shaping (OpenType GSUB/GPOS, Devanagari conjuncts, Arabic ligatures)
+uharfbuzz>=0.55.0
+# Glyph rasterization from shaped glyph sequences
+freetype-py>=2.5.0
+# BiDi visual reorder for RTL scripts (Arabic, Hebrew, Urdu)
+python-bidi>=0.4.2
+# ONNX Runtime (for optional neural font classifier — lazy-loaded)
+onnxruntime>=1.18.0
+
+# ── Phase 3 / Stage 6: Dynamic Language Detection ──────────────────────────────
+# Pure Python language detection for src="auto" support
+langdetect>=1.0.9
